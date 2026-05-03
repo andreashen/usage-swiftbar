@@ -893,52 +893,6 @@ def parse_provider_choice(choice: str) -> Optional[str]:
     return None
 
 
-def parse_new_api_form_text(raw_text: str) -> Dict[str, str]:
-    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-    kv = {}
-    for line in lines:
-        if "=" in line:
-            key, val = line.split("=", 1)
-            kv[key.strip().lower()] = val.strip()
-    api = kv.get("api", "")
-    token = kv.get("api_token", "")
-    if not api and lines:
-        api = lines[0]
-    if not token and len(lines) > 1:
-        token = lines[1]
-    return {"api": api.strip(), "api_token": token.strip()}
-
-
-def compose_new_api_form_text(api_value: str, token_value: str) -> str:
-    return f"api={api_value}\napi_token={token_value}"
-
-
-def prompt_text_with_buttons(
-    message: str,
-    default_text: str,
-    buttons: List[str],
-    default_button: str,
-) -> Optional[Dict[str, str]]:
-    require_macos_interactive()
-    buttons_clause = ", ".join([f'"{apple_quote(btn)}"' for btn in buttons])
-    script = (
-        f'set dialogResult to display dialog "{apple_quote(message)}" '
-        f'default answer "{apple_quote(default_text)}" '
-        f'buttons {{{buttons_clause}}} default button "{apple_quote(default_button)}"\n'
-        'return (button returned of dialogResult) & (ASCII character 31) & (text returned of dialogResult)'
-    )
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    if result.returncode != 0:
-        if "(-128)" in (result.stderr or ""):
-            return None
-        raise PluginError(result.stderr.strip() or "弹窗交互失败")
-    out = result.stdout.strip()
-    if chr(31) not in out:
-        raise PluginError("弹窗结果解析失败")
-    button, text = out.split(chr(31), 1)
-    return {"button": button.strip(), "text": text}
-
-
 def parse_new_api_api_input(api_input: str) -> Dict[str, Any]:
     value = (api_input or "").strip()
     parsed = urllib.parse.urlparse(value)
@@ -1143,7 +1097,162 @@ def validation_summary_text(result: Optional[NewApiValidationResult]) -> str:
     )
 
 
-def prompt_new_api_config(account_name: str) -> Optional[Dict[str, Any]]:
+def prompt_new_api_config() -> Optional[Dict[str, Any]]:
+    require_macos_interactive()
+    try:
+        import tkinter as tk
+    except Exception as err:
+        raise PluginError(f"无法加载图形窗口: {err}")
+
+    state: Dict[str, Any] = {
+        "last_result": None,
+        "tested_signature": None,
+        "saved_payload": None,
+    }
+
+    def signature(name: str, api: str, token: str) -> str:
+        return f"{name.strip()}\n{api.strip()}\n{token.strip()}"
+
+    def render_waiting() -> str:
+        return (
+            "测试结果：\n"
+            "⏳ 一级 API 可达：测试中\n"
+            "⏳ 二级 Token 可用：测试中\n"
+            "⏳ 三级 用量可用：测试中"
+        )
+
+    def fail_result(msg: str) -> NewApiValidationResult:
+        return NewApiValidationResult(
+            level1_ok=False,
+            level1_msg=msg,
+            level2_ok=False,
+            level2_msg="未执行",
+            level3_ok=False,
+            level3_msg="未执行",
+        )
+
+    root = tk.Tk()
+    root.title("配置 New API 账号")
+    root.resizable(False, False)
+    root.attributes("-topmost", True)
+
+    frame = tk.Frame(root, padx=14, pady=12)
+    frame.grid(row=0, column=0, sticky="nsew")
+
+    title_label = tk.Label(
+        frame,
+        text="同一弹窗内填写账号名称、API 链接和 API token",
+        anchor="w",
+        justify="left",
+    )
+    title_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+    tk.Label(frame, text="账号名称").grid(row=1, column=0, sticky="w")
+    name_var = tk.StringVar(value="")
+    name_entry = tk.Entry(frame, textvariable=name_var, width=54)
+    name_entry.grid(row=2, column=0, columnspan=2, sticky="we", pady=(0, 8))
+
+    tk.Label(frame, text="API 链接（Base URL 或完整 Usage Endpoint）").grid(
+        row=3, column=0, sticky="w"
+    )
+    api_var = tk.StringVar(value="https://")
+    api_entry = tk.Entry(frame, textvariable=api_var, width=54)
+    api_entry.grid(row=4, column=0, columnspan=2, sticky="we", pady=(0, 8))
+
+    tk.Label(frame, text="API Token").grid(row=5, column=0, sticky="w")
+    token_var = tk.StringVar(value="")
+    token_entry = tk.Entry(frame, textvariable=token_var, width=54, show="*")
+    token_entry.grid(row=6, column=0, columnspan=2, sticky="we", pady=(0, 8))
+
+    status_var = tk.StringVar(value=validation_summary_text(None))
+    status_label = tk.Label(
+        frame,
+        textvariable=status_var,
+        justify="left",
+        anchor="w",
+        wraplength=520,
+    )
+    status_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 10))
+
+    button_frame = tk.Frame(frame)
+    button_frame.grid(row=8, column=0, columnspan=2, sticky="e")
+
+    def update_status_from_result(result: Optional[NewApiValidationResult]) -> None:
+        status_var.set(validation_summary_text(result))
+        root.update_idletasks()
+
+    def on_test() -> None:
+        name = name_var.get().strip()
+        api = api_var.get().strip()
+        token = token_var.get().strip()
+        if not name:
+            result = fail_result("账号名称不能为空")
+            state["last_result"] = result
+            state["tested_signature"] = None
+            update_status_from_result(result)
+            return
+        status_var.set(render_waiting())
+        root.update_idletasks()
+        root.update()
+        try:
+            result = validate_new_api_config(api, token, timeout=10)
+        except Exception as err:
+            result = fail_result(str(err))
+        state["last_result"] = result
+        if result.all_green():
+            state["tested_signature"] = signature(name, api, token)
+        else:
+            state["tested_signature"] = None
+        update_status_from_result(result)
+
+    def on_save() -> None:
+        name = name_var.get().strip()
+        api = api_var.get().strip()
+        token = token_var.get().strip()
+        if not name:
+            update_status_from_result(fail_result("账号名称不能为空"))
+            return
+        last_result = state.get("last_result")
+        if not isinstance(last_result, NewApiValidationResult) or not last_result.all_green():
+            update_status_from_result(fail_result("保存前必须先测试且三级全绿"))
+            return
+        current_sig = signature(name, api, token)
+        if state.get("tested_signature") != current_sig:
+            update_status_from_result(fail_result("参数已变更，请重新测试"))
+            return
+        parsed_input = parse_new_api_api_input(api)
+        state["saved_payload"] = {
+            "name": name,
+            "api_input": api,
+            "api_token": token,
+            "base_url": parsed_input["base_url"],
+            "usage_path": last_result.usage_path or "",
+            "usage_endpoint": last_result.usage_check_url,
+        }
+        root.destroy()
+
+    def on_cancel() -> None:
+        state["saved_payload"] = None
+        root.destroy()
+
+    test_btn = tk.Button(button_frame, text="测试连接", command=on_test, width=11)
+    test_btn.grid(row=0, column=0, padx=(0, 8))
+    save_btn = tk.Button(button_frame, text="保存配置", command=on_save, width=11)
+    save_btn.grid(row=0, column=1, padx=(0, 8))
+    cancel_btn = tk.Button(button_frame, text="取消", command=on_cancel, width=11)
+    cancel_btn.grid(row=0, column=2)
+
+    def on_close() -> None:
+        on_cancel()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    name_entry.focus_set()
+    root.mainloop()
+    return state.get("saved_payload")
+
+
+def prompt_new_api_config_legacy(account_name: str) -> Optional[Dict[str, Any]]:
+    """Legacy osascript flow retained for reference; no longer used."""
     api_value = "https://"
     token_value = ""
     last_result: Optional[NewApiValidationResult] = None
@@ -1158,7 +1267,7 @@ def prompt_new_api_config(account_name: str) -> Optional[Dict[str, Any]]:
             "仅当三级全绿时可“保存配置”。\n\n"
             f"{validation_summary_text(last_result)}"
         )
-        default_text = compose_new_api_form_text(api_value, token_value)
+        default_text = f"api={api_value}\napi_token={token_value}"
         dialog = prompt_text_with_buttons(
             message=message,
             default_text=default_text,
@@ -1168,9 +1277,15 @@ def prompt_new_api_config(account_name: str) -> Optional[Dict[str, Any]]:
         if dialog is None:
             return None
         button = dialog["button"]
-        form_data = parse_new_api_form_text(dialog["text"])
-        api_value = form_data["api"]
-        token_value = form_data["api_token"]
+        # 兼容旧版输入解析
+        raw_lines = [line.strip() for line in dialog["text"].splitlines() if line.strip()]
+        mapping = {}
+        for line in raw_lines:
+            if "=" in line:
+                k, v = line.split("=", 1)
+                mapping[k.strip().lower()] = v.strip()
+        api_value = mapping.get("api", api_value)
+        token_value = mapping.get("api_token", token_value)
         current_signature = f"{api_value}\n{token_value}"
 
         if button == "测试连接":
@@ -1223,11 +1338,14 @@ def prompt_new_api_config(account_name: str) -> Optional[Dict[str, Any]]:
         raise PluginError(f"未知按钮: {button}")
 
 
-def action_add_new_api_account(config: Dict, name: str, account_id: str) -> None:
-    config_result = prompt_new_api_config(name)
+def action_add_new_api_account(config: Dict) -> None:
+    config_result = prompt_new_api_config()
     if not config_result:
         return
 
+    name = config_result["name"]
+    existing_ids = [item.get("id", "") for item in config.get("accounts", [])]
+    account_id = generate_account_id("new_api", name, existing_ids)
     keychain_account = f"new_api:{account_id}"
     keychain_set(KEYCHAIN_SERVICE, keychain_account, config_result["api_token"])
     account = {
@@ -1283,15 +1401,16 @@ def action_add_account() -> None:
     if provider is None:
         raise PluginError("无效的平台选择")
 
+    if provider == "new_api":
+        action_add_new_api_account(config)
+        return
+
     name = (prompt_text("输入账号显示名称", "") or "").strip()
     if not name:
         raise PluginError("账号名称不能为空")
 
     existing_ids = [item.get("id", "") for item in config.get("accounts", [])]
     account_id = generate_account_id(provider, name, existing_ids)
-    if provider == "new_api":
-        action_add_new_api_account(config, name, account_id)
-        return
 
     account = {
         "id": account_id,
