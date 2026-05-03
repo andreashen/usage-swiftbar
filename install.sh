@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-PLUGIN_NAME="claude-usage.5m.py"
+PLUGIN_NAME="llm-usage.5m.py"
 SWIFTBAR_DIR="$HOME/Library/SwiftBar"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 

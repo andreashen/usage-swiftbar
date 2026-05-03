@@ -10,7 +10,7 @@ Evolve this fork (originally from `joewongjc/claude-usage-swiftbar`) into a gene
 
 - Only Claude Code usage is implemented today.
 - Auth relies on Claude Code OAuth credentials stored in macOS Keychain (via `claude login`).
-- Plugin script name is still `claude-usage.5m.py`.
+- Plugin script name is `llm-usage.5m.py`.
 
 ## Deployment
 
@@ -35,6 +35,6 @@ Run `./install.sh` to install. The script will:
 
 ## Project Structure (current)
 
-- `claude-usage.5m.py` - The SwiftBar plugin script (refreshes every 5 minutes)
+- `llm-usage.5m.py` - The SwiftBar plugin script (refreshes every 5 minutes)
 - `install.sh` - Automated installer
 - `README.md` - User-facing documentation

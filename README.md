@@ -95,21 +95,21 @@ Claude Max 5x
 
 ## 配置
 
-插件每 5 分钟刷新一次（由文件名 `claude-usage.5m.py` 中的 `5m` 决定）。改文件名即可调整刷新频率:
+插件每 5 分钟刷新一次（由文件名 `llm-usage.5m.py` 中的 `5m` 决定）。改文件名即可调整刷新频率:
 
-- `claude-usage.1m.py` - 每分钟
-- `claude-usage.10m.py` - 每 10 分钟
-- `claude-usage.30m.py` - 每 30 分钟
+- `llm-usage.1m.py` - 每分钟
+- `llm-usage.10m.py` - 每 10 分钟
+- `llm-usage.30m.py` - 每 30 分钟
 
 无论刷新频率如何，API 调用都有 30 分钟缓存以避免限流。缓存过期后点"立即刷新"可强制拉取最新数据。
 
-> **提示:** 当前脚本文件名仍为 `claude-usage.*.py`，后续在完成多平台改造时可能会调整为更通用的命名，但刷新频率机制不变。
+> **提示:** 当前脚本文件名为 `llm-usage.*.py`，刷新频率机制不变。
 
 ## 卸载
 
 ```bash
-rm ~/Library/SwiftBar/claude-usage.5m.py
-rm -f ~/.local/state/claude-usage-cache.json
+rm ~/Library/SwiftBar/llm-usage.5m.py
+rm -f ~/.local/state/llm-usage-cache.json
 ```
 
 ## 致谢
