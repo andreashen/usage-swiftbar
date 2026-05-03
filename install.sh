@@ -4,7 +4,6 @@ set -euo pipefail
 PLUGIN_NAME="claude-usage.5m.py"
 SWIFTBAR_DIR="$HOME/Library/SwiftBar"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-KEYCHAIN_SERVICE="Claude Code-credentials"
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$1"; }
 ok()    { printf '\033[1;32m==>\033[0m %s\n' "$1"; }
@@ -28,13 +27,12 @@ if ! brew list --cask swiftbar &>/dev/null; then
     brew install --cask swiftbar
 fi
 
-# 4. Claude Code credentials
-if ! security find-generic-password -s "$KEYCHAIN_SERVICE" &>/dev/null 2>&1; then
-    error "Claude Code OAuth credentials not found in Keychain."
-    error "Please run 'claude login' first, then re-run this script."
+# 4. Python 3
+if ! command -v python3 &>/dev/null; then
+    error "python3 is required but not found."
     exit 1
 fi
-ok "Claude Code credentials found."
+ok "python3 detected."
 
 # 5. Plugin directory
 if [[ ! -d "$SWIFTBAR_DIR" ]]; then
@@ -64,4 +62,4 @@ fi
 
 echo ""
 ok "Done! Look for the ◆ icon in your menu bar."
-ok "The plugin refreshes every 5 minutes. Click it to see usage details."
+ok "Use the plugin menu to add providers/accounts via GUI prompts."
