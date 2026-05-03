@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 APP_NAME = "llm-usage-swiftbar"
 CONFIG_FILE = os.path.expanduser("~/.config/llm-usage-swiftbar/config.json")
@@ -61,6 +61,16 @@ NEW_API_PATH_CANDIDATES = [
     "/v1/dashboard/billing/usage",
 ]
 
+URL_BASELIKE_PATHS = {
+    "",
+    "/",
+    "/v1",
+    "/api",
+    "/openai",
+    "/v1beta",
+    "/v1beta1",
+}
+
 
 class PluginError(RuntimeError):
     pass
@@ -83,6 +93,23 @@ class AccountUsage:
     account_name: str
     windows: List[WindowUsage]
     error: Optional[str] = None
+
+
+@dataclass
+class NewApiValidationResult:
+    level1_ok: bool
+    level1_msg: str
+    level2_ok: bool
+    level2_msg: str
+    level3_ok: bool
+    level3_msg: str
+    token_check_url: Optional[str] = None
+    usage_check_url: Optional[str] = None
+    usage_path: Optional[str] = None
+    is_base_input: bool = True
+
+    def all_green(self) -> bool:
+        return self.level1_ok and self.level2_ok and self.level3_ok
 
 
 class ProviderAdapter:
@@ -866,6 +893,367 @@ def parse_provider_choice(choice: str) -> Optional[str]:
     return None
 
 
+def parse_new_api_form_text(raw_text: str) -> Dict[str, str]:
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    kv = {}
+    for line in lines:
+        if "=" in line:
+            key, val = line.split("=", 1)
+            kv[key.strip().lower()] = val.strip()
+    api = kv.get("api", "")
+    token = kv.get("api_token", "")
+    if not api and lines:
+        api = lines[0]
+    if not token and len(lines) > 1:
+        token = lines[1]
+    return {"api": api.strip(), "api_token": token.strip()}
+
+
+def compose_new_api_form_text(api_value: str, token_value: str) -> str:
+    return f"api={api_value}\napi_token={token_value}"
+
+
+def prompt_text_with_buttons(
+    message: str,
+    default_text: str,
+    buttons: List[str],
+    default_button: str,
+) -> Optional[Dict[str, str]]:
+    require_macos_interactive()
+    buttons_clause = ", ".join([f'"{apple_quote(btn)}"' for btn in buttons])
+    script = (
+        f'set dialogResult to display dialog "{apple_quote(message)}" '
+        f'default answer "{apple_quote(default_text)}" '
+        f'buttons {{{buttons_clause}}} default button "{apple_quote(default_button)}"\n'
+        'return (button returned of dialogResult) & (ASCII character 31) & (text returned of dialogResult)'
+    )
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        if "(-128)" in (result.stderr or ""):
+            return None
+        raise PluginError(result.stderr.strip() or "弹窗交互失败")
+    out = result.stdout.strip()
+    if chr(31) not in out:
+        raise PluginError("弹窗结果解析失败")
+    button, text = out.split(chr(31), 1)
+    return {"button": button.strip(), "text": text}
+
+
+def parse_new_api_api_input(api_input: str) -> Dict[str, Any]:
+    value = (api_input or "").strip()
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise PluginError("api 必须是完整 HTTP/HTTPS 地址")
+
+    clean = urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path or "", "", parsed.query or "", "")
+    ).rstrip("/")
+    path = (parsed.path or "").rstrip("/")
+    is_base = path in URL_BASELIKE_PATHS
+    if not is_base and parsed.query:
+        is_base = False
+    elif not is_base and "usage" not in path.lower() and "billing" not in path.lower():
+        # 非 usage-like path 也可能是网关 base（如 /openai/v1）
+        is_base = True
+
+    if is_base:
+        base_url = clean
+        return {
+            "api_input": value,
+            "is_base_input": True,
+            "base_url": base_url,
+            "usage_endpoint": None,
+        }
+
+    base_root = f"{parsed.scheme}://{parsed.netloc}"
+    return {
+        "api_input": value,
+        "is_base_input": False,
+        "base_url": base_root,
+        "usage_endpoint": clean,
+    }
+
+
+def build_usage_targets(api_input_parsed: Dict[str, Any]) -> List[str]:
+    if not api_input_parsed.get("is_base_input"):
+        endpoint = api_input_parsed.get("usage_endpoint")
+        return [endpoint] if endpoint else []
+
+    base_url = api_input_parsed.get("base_url", "")
+    targets = [join_base_url(base_url, suffix) for suffix in NEW_API_PATH_CANDIDATES]
+    return dedupe_list(targets)
+
+
+def http_probe_status(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 10) -> Dict[str, Any]:
+    req = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = int(getattr(resp, "status", 200))
+            return {"reachable": True, "status": status, "message": f"HTTP {status}", "url": url}
+    except urllib.error.HTTPError as err:
+        return {"reachable": True, "status": int(err.code), "message": f"HTTP {int(err.code)}", "url": url}
+    except urllib.error.URLError as err:
+        return {"reachable": False, "status": None, "message": str(err.reason), "url": url}
+
+
+def derive_usage_path(base_url: str, usage_url: str) -> str:
+    if usage_url.startswith("http://") or usage_url.startswith("https://"):
+        if usage_url.startswith(base_url.rstrip("/")):
+            sub = usage_url[len(base_url.rstrip("/")):]
+            return sub or "/"
+        return usage_url
+    return usage_url
+
+
+def probe_new_api_usage(url: str, api_token: str, timeout: int = 10) -> Dict[str, Any]:
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Accept": "application/json",
+        "User-Agent": "llm-usage-swiftbar/1.0",
+    }
+    data = http_get_json(url, headers=headers, timeout=timeout)
+    windows = parse_new_api_usage_payload(data)
+    if not windows:
+        raise PluginError("返回结构缺少可识别字段（需要 used/total/remaining 或 utilization）")
+    return {"windows": windows, "payload": data}
+
+
+def validate_new_api_config(api_input: str, api_token: str, timeout: int = 10) -> NewApiValidationResult:
+    if not api_input:
+        return NewApiValidationResult(
+            level1_ok=False,
+            level1_msg="api 不能为空",
+            level2_ok=False,
+            level2_msg="未执行",
+            level3_ok=False,
+            level3_msg="未执行",
+        )
+    if not api_token:
+        return NewApiValidationResult(
+            level1_ok=False,
+            level1_msg="api_token 不能为空",
+            level2_ok=False,
+            level2_msg="未执行",
+            level3_ok=False,
+            level3_msg="未执行",
+        )
+
+    parsed_input = parse_new_api_api_input(api_input)
+    level1_target = parsed_input["base_url"] if parsed_input["is_base_input"] else parsed_input["usage_endpoint"]
+    l1 = http_probe_status(level1_target, headers={"User-Agent": "llm-usage-swiftbar/1.0"}, timeout=timeout)
+    if not l1["reachable"]:
+        return NewApiValidationResult(
+            level1_ok=False,
+            level1_msg=f"不可达: {l1['message']} ({level1_target})",
+            level2_ok=False,
+            level2_msg="未执行",
+            level3_ok=False,
+            level3_msg="未执行",
+            is_base_input=parsed_input["is_base_input"],
+        )
+
+    usage_targets = build_usage_targets(parsed_input)
+    if not usage_targets:
+        return NewApiValidationResult(
+            level1_ok=True,
+            level1_msg=f"{l1['message']} ({level1_target})",
+            level2_ok=False,
+            level2_msg="未找到可校验 endpoint",
+            level3_ok=False,
+            level3_msg="未找到可校验 endpoint",
+            is_base_input=parsed_input["is_base_input"],
+        )
+
+    token_endpoint = None
+    token_msg = "未找到可验证 token 的 endpoint"
+    probe_headers = {"User-Agent": "llm-usage-swiftbar/1.0"}
+    auth_headers = {
+        "User-Agent": "llm-usage-swiftbar/1.0",
+        "Authorization": f"Bearer {api_token}",
+    }
+    for target in usage_targets:
+        no_auth = http_probe_status(target, headers=probe_headers, timeout=timeout)
+        with_auth = http_probe_status(target, headers=auth_headers, timeout=timeout)
+        if not with_auth["reachable"]:
+            token_msg = f"请求失败: {with_auth['message']} ({target})"
+            continue
+        if with_auth["status"] in (401, 403):
+            token_msg = f"鉴权失败: HTTP {with_auth['status']} ({target})"
+            continue
+        if no_auth["status"] in (401, 403) and with_auth["status"] not in (401, 403):
+            token_endpoint = target
+            token_msg = f"通过（使用 {target}）"
+            break
+        if no_auth["status"] is None or no_auth["status"] != with_auth["status"]:
+            token_endpoint = target
+            token_msg = f"通过（状态差异验证，使用 {target}）"
+            break
+
+    level2_ok = token_endpoint is not None
+
+    usage_ok = False
+    usage_msg = "未校验"
+    usage_endpoint = None
+    usage_path = None
+    for target in usage_targets:
+        try:
+            probe_new_api_usage(target, api_token, timeout=timeout)
+            usage_ok = True
+            usage_endpoint = target
+            usage_msg = f"可解析用量字段（{target}）"
+            usage_path = derive_usage_path(parsed_input["base_url"], target)
+            break
+        except Exception as err:
+            usage_msg = f"{err} ({target})"
+
+    return NewApiValidationResult(
+        level1_ok=True,
+        level1_msg=f"{l1['message']} ({level1_target})",
+        level2_ok=level2_ok,
+        level2_msg=token_msg,
+        level3_ok=usage_ok,
+        level3_msg=usage_msg,
+        token_check_url=token_endpoint,
+        usage_check_url=usage_endpoint,
+        usage_path=usage_path,
+        is_base_input=parsed_input["is_base_input"],
+    )
+
+
+def format_validation_line(ok: bool, title: str, msg: str) -> str:
+    lamp = "🟢" if ok else "🔴"
+    return f"{lamp} {title}: {msg}"
+
+
+def validation_summary_text(result: Optional[NewApiValidationResult]) -> str:
+    if result is None:
+        return (
+            "测试结果：\n"
+            "🔴 一级 API 可达：未测试\n"
+            "🔴 二级 Token 可用：未测试\n"
+            "🔴 三级 用量可用：未测试"
+        )
+    return "\n".join(
+        [
+            "测试结果：",
+            format_validation_line(result.level1_ok, "一级 API 可达", result.level1_msg),
+            format_validation_line(result.level2_ok, "二级 Token 可用", result.level2_msg),
+            format_validation_line(result.level3_ok, "三级 用量可用", result.level3_msg),
+        ]
+    )
+
+
+def prompt_new_api_config(account_name: str) -> Optional[Dict[str, Any]]:
+    api_value = "https://"
+    token_value = ""
+    last_result: Optional[NewApiValidationResult] = None
+    tested_signature = None
+    while True:
+        message = (
+            f"配置 New API 账号：{account_name}\n\n"
+            "请在同一输入框按如下格式填写：\n"
+            "api=<Base URL 或完整 Usage Endpoint>\n"
+            "api_token=<Token>\n\n"
+            "点击“测试连接”执行三级校验（仅测试，不保存）。\n"
+            "仅当三级全绿时可“保存配置”。\n\n"
+            f"{validation_summary_text(last_result)}"
+        )
+        default_text = compose_new_api_form_text(api_value, token_value)
+        dialog = prompt_text_with_buttons(
+            message=message,
+            default_text=default_text,
+            buttons=["取消", "测试连接", "保存配置"],
+            default_button="测试连接",
+        )
+        if dialog is None:
+            return None
+        button = dialog["button"]
+        form_data = parse_new_api_form_text(dialog["text"])
+        api_value = form_data["api"]
+        token_value = form_data["api_token"]
+        current_signature = f"{api_value}\n{token_value}"
+
+        if button == "测试连接":
+            try:
+                last_result = validate_new_api_config(api_value, token_value, timeout=10)
+                if last_result.all_green():
+                    tested_signature = current_signature
+            except Exception as err:
+                last_result = NewApiValidationResult(
+                    level1_ok=False,
+                    level1_msg=str(err),
+                    level2_ok=False,
+                    level2_msg="未执行",
+                    level3_ok=False,
+                    level3_msg="未执行",
+                )
+                tested_signature = None
+            continue
+
+        if button == "保存配置":
+            if not last_result or not last_result.all_green():
+                last_result = last_result or NewApiValidationResult(
+                    level1_ok=False,
+                    level1_msg="尚未测试",
+                    level2_ok=False,
+                    level2_msg="尚未测试",
+                    level3_ok=False,
+                    level3_msg="尚未测试",
+                )
+                continue
+            if tested_signature != current_signature:
+                last_result = NewApiValidationResult(
+                    level1_ok=False,
+                    level1_msg="参数已变更，请重新测试",
+                    level2_ok=False,
+                    level2_msg="参数已变更，请重新测试",
+                    level3_ok=False,
+                    level3_msg="参数已变更，请重新测试",
+                )
+                continue
+            parsed_input = parse_new_api_api_input(api_value)
+            return {
+                "api_input": api_value,
+                "api_token": token_value,
+                "base_url": parsed_input["base_url"],
+                "usage_path": last_result.usage_path or "",
+                "usage_endpoint": last_result.usage_check_url,
+            }
+
+        raise PluginError(f"未知按钮: {button}")
+
+
+def action_add_new_api_account(config: Dict, name: str, account_id: str) -> None:
+    config_result = prompt_new_api_config(name)
+    if not config_result:
+        return
+
+    keychain_account = f"new_api:{account_id}"
+    keychain_set(KEYCHAIN_SERVICE, keychain_account, config_result["api_token"])
+    account = {
+        "id": account_id,
+        "provider": "new_api",
+        "name": name,
+        "enabled": True,
+        "settings": {
+            "base_url": config_result["base_url"],
+            "usage_path": config_result.get("usage_path") or "",
+        },
+        "auth": {
+            "type": "keychain",
+            "service": KEYCHAIN_SERVICE,
+            "account": keychain_account,
+        },
+        "manual_windows": [],
+    }
+    config.setdefault("accounts", []).append(account)
+    if not config.get("primary_account_id"):
+        config["primary_account_id"] = account_id
+    save_config(config)
+    clear_cache()
+    notify(f"已添加账号: {name}")
+
+
 def generate_account_id(provider: str, name: str, existing_ids: List[str]) -> str:
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", name.strip().lower()).strip("-")
     if not slug:
@@ -901,41 +1289,24 @@ def action_add_account() -> None:
 
     existing_ids = [item.get("id", "") for item in config.get("accounts", [])]
     account_id = generate_account_id(provider, name, existing_ids)
+    if provider == "new_api":
+        action_add_new_api_account(config, name, account_id)
+        return
+
     account = {
         "id": account_id,
         "provider": provider,
         "name": name,
         "enabled": True,
-        "settings": {},
+        "settings": {"mode": "manual"},
         "manual_windows": [],
     }
-
-    if provider == "new_api":
-        base_url = (prompt_text("输入 Base URL（例: https://api.example.com）", "https://") or "").strip()
-        if not base_url:
-            raise PluginError("Base URL 不能为空")
-        usage_path = (prompt_text("可选：用量接口路径（留空自动探测）", "") or "").strip()
-        api_key = (prompt_text("输入 API Key（可留空）", "", hidden=True) or "").strip()
-        account["settings"]["base_url"] = base_url.rstrip("/")
-        if usage_path:
-            account["settings"]["usage_path"] = usage_path
-        if api_key:
-            keychain_account = f"{provider}:{account_id}"
-            keychain_set(KEYCHAIN_SERVICE, keychain_account, api_key)
-            account["auth"] = {
-                "type": "keychain",
-                "service": KEYCHAIN_SERVICE,
-                "account": keychain_account,
-            }
-    else:
-        account["settings"]["mode"] = "manual"
-        notify(f"{PROVIDER_LABELS[provider]} 暂以手工窗口模式接入")
-
     config.setdefault("accounts", []).append(account)
     if not config.get("primary_account_id"):
         config["primary_account_id"] = account_id
     save_config(config)
     clear_cache()
+    notify(f"{PROVIDER_LABELS[provider]} 暂以手工窗口模式接入")
 
     if confirm_dialog("是否立即添加一个手工窗口？"):
         action_add_window(account_id)
