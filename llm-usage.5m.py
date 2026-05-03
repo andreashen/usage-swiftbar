@@ -53,23 +53,9 @@ CATEGORY_ORDER = {
     "no_reset": 5,
 }
 
-NEW_API_PATH_CANDIDATES = [
-    "/api/usage/token",
-    "/api/usage",
-    "/usage",
-    "/v1/usage",
-    "/v1/dashboard/billing/usage",
-]
-
-URL_BASELIKE_PATHS = {
-    "",
-    "/",
-    "/v1",
-    "/api",
-    "/openai",
-    "/v1beta",
-    "/v1beta1",
-}
+NEW_API_USER_SELF_PATH = "/api/user/self"
+NEW_API_TOKEN_LIST_PATH = "/api/token/"
+QUOTA_PER_USD = 500000.0
 
 
 class PluginError(RuntimeError):
@@ -93,6 +79,7 @@ class AccountUsage:
     account_name: str
     windows: List[WindowUsage]
     error: Optional[str] = None
+    details: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -103,10 +90,8 @@ class NewApiValidationResult:
     level2_msg: str
     level3_ok: bool
     level3_msg: str
-    token_check_url: Optional[str] = None
-    usage_check_url: Optional[str] = None
-    usage_path: Optional[str] = None
-    is_base_input: bool = True
+    user_self_url: Optional[str] = None
+    token_list_url: Optional[str] = None
 
     def all_green(self) -> bool:
         return self.level1_ok and self.level2_ok and self.level3_ok
@@ -144,55 +129,178 @@ class NewApiProviderAdapter(ProviderAdapter):
     provider_name = "new_api"
 
     def fetch(self, account: Dict) -> AccountUsage:
-        windows = self.fetch_remote_windows(account)
+        details = fetch_new_api_account_details(account)
+        windows = details_to_windows(details)
         if not windows:
             windows = load_manual_windows(account)
         if not windows:
-            raise PluginError("未识别到远程用量接口，且未配置手工窗口")
+            raise PluginError("未识别到远程数据，且未配置手工窗口")
         return AccountUsage(
             account_id=account["id"],
             provider=account["provider"],
             account_name=account["name"],
             windows=windows,
+            details=details,
         )
 
-    def fetch_remote_windows(self, account: Dict) -> List[WindowUsage]:
-        settings = account.get("settings", {})
-        base_url = (settings.get("base_url") or "").strip()
-        if not base_url:
-            return []
 
-        api_key = load_account_api_key(account)
-        if not api_key:
-            return []
+def new_api_headers(user_id: str, token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "New-Api-User": user_id,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "llm-usage-swiftbar/1.0",
+    }
 
-        usage_path = (settings.get("usage_path") or "").strip()
-        paths = []
-        if usage_path:
-            paths.append(usage_path)
-        paths.extend(NEW_API_PATH_CANDIDATES)
 
-        last_err = None
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json",
-            "User-Agent": "llm-usage-swiftbar/1.0",
-        }
+def http_get_json_allow_query(url: str, headers: Dict[str, str], timeout: int = 10) -> Dict:
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+        return json.loads(raw)
+    except urllib.error.HTTPError as err:
+        body = err.read().decode("utf-8", errors="ignore")
+        raise PluginError(f"HTTP {err.code} ({url}): {body[:160]}")
+    except urllib.error.URLError as err:
+        raise PluginError(f"请求失败 ({url}): {err.reason}")
+    except json.JSONDecodeError:
+        raise PluginError(f"接口返回非 JSON ({url})")
 
-        for path in dedupe_list(paths):
-            try:
-                data = http_get_json(join_base_url(base_url, path), headers=headers, timeout=10)
-                windows = parse_new_api_usage_payload(data)
-                if windows:
-                    return windows
-                last_err = "返回结构未包含可识别的用量字段"
-            except Exception as err:
-                last_err = str(err)
 
-        if last_err:
-            raise PluginError(last_err)
-        return []
+def extract_success_payload(payload: Dict, url: str) -> Any:
+    if not isinstance(payload, dict):
+        raise PluginError(f"返回结构非法 ({url})")
+    if payload.get("success") is False:
+        raise PluginError(payload.get("message") or f"接口返回失败 ({url})")
+    return payload.get("data", payload)
 
+
+def fetch_new_api_user_self(base_url: str, user_id: str, token: str, timeout: int = 10) -> Dict[str, Any]:
+    url = join_base_url(base_url, NEW_API_USER_SELF_PATH)
+    payload = http_get_json_allow_query(url, headers=new_api_headers(user_id, token), timeout=timeout)
+    data = extract_success_payload(payload, url)
+    if not isinstance(data, dict):
+        raise PluginError("/api/user/self data 结构异常")
+    return data
+
+
+def extract_new_api_token_items(data: Any) -> List[Dict[str, Any]]:
+    if isinstance(data, dict):
+        items = data.get("items")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    return []
+
+
+def fetch_new_api_tokens(base_url: str, user_id: str, token: str, timeout: int = 10) -> List[Dict[str, Any]]:
+    page = 1
+    size = 50
+    all_items: List[Dict[str, Any]] = []
+    while True:
+        query = urllib.parse.urlencode({"p": page, "size": size})
+        url = f"{join_base_url(base_url, NEW_API_TOKEN_LIST_PATH)}?{query}"
+        payload = http_get_json_allow_query(url, headers=new_api_headers(user_id, token), timeout=timeout)
+        data = extract_success_payload(payload, url)
+        items = extract_new_api_token_items(data)
+        all_items.extend(items)
+
+        if isinstance(data, dict):
+            total = int(parse_float(data.get("total")) or 0)
+            page_no = int(parse_float(data.get("page")) or page)
+            page_size = int(parse_float(data.get("page_size") or data.get("size")) or size)
+            if page_size <= 0:
+                break
+            if page_no * page_size >= total:
+                break
+            page = page_no + 1
+            continue
+        break
+    return all_items
+
+
+def quota_to_usd(quota) -> float:
+    val = parse_float(quota)
+    if val is None:
+        return 0.0
+    return val / QUOTA_PER_USD
+
+
+def format_usd(value: float) -> str:
+    return f"${value:.2f}"
+
+
+def normalize_expired_time(value) -> str:
+    sec = parse_float(value)
+    if sec is None:
+        return "--"
+    if int(sec) < 0:
+        return "永不过期"
+    if int(sec) == 0:
+        return "--"
+    try:
+        dt = datetime.fromtimestamp(int(sec), tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return "--"
+
+
+def details_to_windows(details: Dict[str, Any]) -> List[WindowUsage]:
+    user = details.get("user", {})
+    tokens = details.get("tokens", [])
+    if not isinstance(user, dict):
+        user = {}
+    if not isinstance(tokens, list):
+        tokens = []
+    quota = parse_float(user.get("quota")) or 0.0
+    used = parse_float(user.get("used_quota")) or 0.0
+    util = 0.0
+    if quota > 0:
+        util = min(max((used / quota) * 100.0, 0.0), 100.0)
+    window = WindowUsage(
+        category="month",
+        label="余额(USD)",
+        utilization=util,
+        note=f"余额 {format_usd(quota_to_usd(quota))}",
+    )
+    if tokens:
+        return [window]
+    return [window]
+
+
+def fetch_new_api_account_details(account: Dict) -> Dict[str, Any]:
+    settings = account.get("settings", {})
+    base_url = (settings.get("base_url") or "").strip()
+    user_id = str(settings.get("user_id") or "").strip()
+    token = load_account_api_key(account)
+    if not base_url:
+        raise PluginError("缺少 Base URL")
+    if not user_id:
+        raise PluginError("缺少 user_id")
+    if not token:
+        raise PluginError("缺少用户级系统访问令牌")
+
+    user = fetch_new_api_user_self(base_url, user_id, token, timeout=10)
+    tokens = fetch_new_api_tokens(base_url, user_id, token, timeout=10)
+    enabled = [item for item in tokens if int(parse_float(item.get("status")) or 0) == 1]
+    token_cards = []
+    for item in enabled:
+        remain = parse_float(item.get("remain_quota")) or 0.0
+        used = parse_float(item.get("used_quota")) or 0.0
+        total = remain + used
+        token_cards.append(
+            {
+                "name": item.get("name") or f"Token-{item.get('id', '')}",
+                "remain_quota": remain,
+                "used_quota": used,
+                "total_quota": total,
+                "expired_at": normalize_expired_time(item.get("expired_time")),
+            }
+        )
+    return {"user": user, "tokens": token_cards}
 
 ADAPTERS = {
     "new_api": NewApiProviderAdapter(),
@@ -272,6 +380,7 @@ def serialize_account_usage(item: AccountUsage) -> Dict:
         "provider": item.provider,
         "account_name": item.account_name,
         "error": item.error,
+        "details": item.details or {},
         "windows": [
             {
                 "category": window.category,
@@ -305,6 +414,7 @@ def deserialize_account_usage(data: Dict) -> AccountUsage:
         account_name=data.get("account_name", ""),
         windows=sort_windows(windows),
         error=data.get("error"),
+        details=data.get("details") if isinstance(data.get("details"), dict) else {},
     )
 
 
@@ -412,6 +522,8 @@ def render_menu(config: Dict, usages: List[AccountUsage], cache_age: Optional[fl
             print(f"--{star} {account_usage.account_name} | size=11 {NOOP}")
             if account_usage.error:
                 print(f"----⚠ {account_usage.error} | size=10 color=#EF4444 {NOOP}")
+            if account_usage.provider == "new_api":
+                render_new_api_account_details(account_usage)
             for window in sort_windows(account_usage.windows):
                 render_window_line(window)
             if not primary or primary.account_id != account_usage.account_id:
@@ -459,6 +571,36 @@ def render_window_line(window: WindowUsage) -> None:
         )
     if window.note:
         print(f"------备注: {window.note} | size=10 {NOOP}")
+
+
+def render_new_api_account_details(account_usage: AccountUsage) -> None:
+    details = account_usage.details or {}
+    user = details.get("user", {})
+    tokens = details.get("tokens", [])
+    if not isinstance(user, dict):
+        user = {}
+    if not isinstance(tokens, list):
+        tokens = []
+
+    quota_val = parse_float(user.get("quota")) or 0.0
+    wallet_usd = quota_to_usd(quota_val)
+    print(f"----💰 钱包余额 ${wallet_usd:.2f} | size=10 {NOOP}")
+
+    if not tokens:
+        print(f"----(无已启用 Token) | size=10 {NOOP}")
+        return
+
+    for token in tokens:
+        if not isinstance(token, dict):
+            continue
+        token_name = token.get("name") or "Token"
+        remain_usd = quota_to_usd(parse_float(token.get("remain_quota")) or 0.0)
+        total_usd = quota_to_usd(parse_float(token.get("total_quota")) or 0.0)
+        expired = token.get("expired_at") or "永不过期"
+        print(f"----🔑 {token_name} | size=10 {NOOP}")
+        print(f"------剩余额度 ${remain_usd:.2f} | size=10 {NOOP}")
+        print(f"------总额度 ${total_usd:.2f} | size=10 {NOOP}")
+        print(f"------过期时间 {expired} | size=10 {NOOP}")
 
 
 def group_by_provider(usages: List[AccountUsage]) -> Dict[str, List[AccountUsage]]:
@@ -521,118 +663,12 @@ def parse_float(value) -> Optional[float]:
         return None
 
 
-def parse_new_api_usage_payload(data: Dict) -> List[WindowUsage]:
-    candidates = [data]
-    if isinstance(data, dict):
-        for key in ("data", "result", "usage", "quota"):
-            if isinstance(data.get(key), dict):
-                candidates.append(data[key])
-            if isinstance(data.get(key), list):
-                for item in data[key]:
-                    if isinstance(item, dict):
-                        candidates.append(item)
-
-    for candidate in candidates:
-        parsed = parse_usage_candidate(candidate)
-        if parsed:
-            return parsed
-    return []
-
-
-def parse_usage_candidate(candidate: Dict) -> List[WindowUsage]:
-    if not isinstance(candidate, dict):
-        return []
-
-    window_list = []
-    if isinstance(candidate.get("windows"), list):
-        for item in candidate["windows"]:
-            window = parse_usage_window(item)
-            if window:
-                window_list.append(window)
-        if window_list:
-            return sort_windows(window_list)
-
-    single = parse_usage_window(candidate)
-    if single:
-        return [single]
-    return []
-
-
-def parse_usage_window(item: Dict) -> Optional[WindowUsage]:
-    if not isinstance(item, dict):
-        return None
-
-    utilization = pick_float(item, ["utilization", "usage_rate", "percent", "percentage"])
-    used = pick_float(item, ["used", "used_quota", "usage", "consumed", "spent"])
-    total = pick_float(item, ["total", "total_quota", "quota", "limit", "monthly_limit"])
-    remaining = pick_float(item, ["remaining", "left", "balance", "available"])
-
-    if utilization is None:
-        if used is not None and total and total > 0:
-            utilization = used / total * 100.0
-        elif remaining is not None and total and total > 0:
-            utilization = (1 - remaining / total) * 100.0
-        else:
-            return None
-
-    label = (
-        item.get("label")
-        or item.get("name")
-        or item.get("window")
-        or item.get("period")
-        or "额度"
-    )
-    resets_at = (
-        item.get("resets_at")
-        or item.get("reset_at")
-        or item.get("resetAt")
-        or item.get("next_reset_at")
-        or item.get("nextResetAt")
-    )
-    category = infer_category(str(label))
-    total_hours = WINDOW_CATEGORIES.get(category, WINDOW_CATEGORIES["custom"])["hours"]
-    note = ""
-    if used is not None and total is not None:
-        note = f"已用 {trim_float(used)} / 总额 {trim_float(total)}"
-
-    return WindowUsage(
-        category=category,
-        label=str(label),
-        utilization=normalize_percentage(utilization),
-        resets_at=resets_at,
-        total_hours=total_hours,
-        note=note,
-    )
-
-
-def pick_float(payload: Dict, keys: List[str]) -> Optional[float]:
-    for key in keys:
-        if key in payload:
-            value = parse_float(payload.get(key))
-            if value is not None:
-                return value
-    return None
-
-
-def infer_category(name: str) -> str:
-    text = name.lower()
-    if "5" in text and ("hour" in text or "小时" in text):
-        return "five_hour"
-    if "day" in text or "日" in text or "daily" in text:
-        return "day"
-    if "week" in text or "周" in text:
-        return "week"
-    if "month" in text or "月" in text or "billing" in text:
-        return "month"
-    if "no reset" in text or "不重置" in text or "永久" in text:
-        return "no_reset"
-    return "custom"
-
-
-def trim_float(value: float) -> str:
-    if int(value) == value:
-        return str(int(value))
-    return f"{value:.2f}"
+def parse_new_api_base_url(api_input: str) -> str:
+    value = (api_input or "").strip()
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise PluginError("API 链接必须是完整 HTTP/HTTPS Base URL")
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def progress_bar(value, width=BAR_WIDTH):
@@ -895,47 +931,7 @@ def parse_provider_choice(choice: str) -> Optional[str]:
 
 def parse_new_api_api_input(api_input: str) -> Dict[str, Any]:
     value = (api_input or "").strip()
-    parsed = urllib.parse.urlparse(value)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise PluginError("api 必须是完整 HTTP/HTTPS 地址")
-
-    clean = urllib.parse.urlunparse(
-        (parsed.scheme, parsed.netloc, parsed.path or "", "", parsed.query or "", "")
-    ).rstrip("/")
-    path = (parsed.path or "").rstrip("/")
-    is_base = path in URL_BASELIKE_PATHS
-    if not is_base and parsed.query:
-        is_base = False
-    elif not is_base and "usage" not in path.lower() and "billing" not in path.lower():
-        # 非 usage-like path 也可能是网关 base（如 /openai/v1）
-        is_base = True
-
-    if is_base:
-        base_url = clean
-        return {
-            "api_input": value,
-            "is_base_input": True,
-            "base_url": base_url,
-            "usage_endpoint": None,
-        }
-
-    base_root = f"{parsed.scheme}://{parsed.netloc}"
-    return {
-        "api_input": value,
-        "is_base_input": False,
-        "base_url": base_root,
-        "usage_endpoint": clean,
-    }
-
-
-def build_usage_targets(api_input_parsed: Dict[str, Any]) -> List[str]:
-    if not api_input_parsed.get("is_base_input"):
-        endpoint = api_input_parsed.get("usage_endpoint")
-        return [endpoint] if endpoint else []
-
-    base_url = api_input_parsed.get("base_url", "")
-    targets = [join_base_url(base_url, suffix) for suffix in NEW_API_PATH_CANDIDATES]
-    return dedupe_list(targets)
+    return {"api_input": value, "base_url": parse_new_api_base_url(value)}
 
 
 def http_probe_status(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 10) -> Dict[str, Any]:
@@ -950,29 +946,12 @@ def http_probe_status(url: str, headers: Optional[Dict[str, str]] = None, timeou
         return {"reachable": False, "status": None, "message": str(err.reason), "url": url}
 
 
-def derive_usage_path(base_url: str, usage_url: str) -> str:
-    if usage_url.startswith("http://") or usage_url.startswith("https://"):
-        if usage_url.startswith(base_url.rstrip("/")):
-            sub = usage_url[len(base_url.rstrip("/")):]
-            return sub or "/"
-        return usage_url
-    return usage_url
-
-
-def probe_new_api_usage(url: str, api_token: str, timeout: int = 10) -> Dict[str, Any]:
-    headers = {
-        "Authorization": f"Bearer {api_token}",
-        "Accept": "application/json",
-        "User-Agent": "llm-usage-swiftbar/1.0",
-    }
-    data = http_get_json(url, headers=headers, timeout=timeout)
-    windows = parse_new_api_usage_payload(data)
-    if not windows:
-        raise PluginError("返回结构缺少可识别字段（需要 used/total/remaining 或 utilization）")
-    return {"windows": windows, "payload": data}
-
-
-def validate_new_api_config(api_input: str, api_token: str, timeout: int = 10) -> NewApiValidationResult:
+def validate_new_api_config(
+    api_input: str,
+    user_id: str,
+    api_token: str,
+    timeout: int = 10,
+) -> NewApiValidationResult:
     if not api_input:
         return NewApiValidationResult(
             level1_ok=False,
@@ -982,10 +961,19 @@ def validate_new_api_config(api_input: str, api_token: str, timeout: int = 10) -
             level3_ok=False,
             level3_msg="未执行",
         )
+    if not user_id:
+        return NewApiValidationResult(
+            level1_ok=False,
+            level1_msg="user_id 不能为空",
+            level2_ok=False,
+            level2_msg="未执行",
+            level3_ok=False,
+            level3_msg="未执行",
+        )
     if not api_token:
         return NewApiValidationResult(
             level1_ok=False,
-            level1_msg="api_token 不能为空",
+            level1_msg="用户级系统访问令牌不能为空",
             level2_ok=False,
             level2_msg="未执行",
             level3_ok=False,
@@ -993,7 +981,8 @@ def validate_new_api_config(api_input: str, api_token: str, timeout: int = 10) -
         )
 
     parsed_input = parse_new_api_api_input(api_input)
-    level1_target = parsed_input["base_url"] if parsed_input["is_base_input"] else parsed_input["usage_endpoint"]
+    base_url = parsed_input["base_url"]
+    level1_target = base_url
     l1 = http_probe_status(level1_target, headers={"User-Agent": "llm-usage-swiftbar/1.0"}, timeout=timeout)
     if not l1["reachable"]:
         return NewApiValidationResult(
@@ -1003,74 +992,50 @@ def validate_new_api_config(api_input: str, api_token: str, timeout: int = 10) -
             level2_msg="未执行",
             level3_ok=False,
             level3_msg="未执行",
-            is_base_input=parsed_input["is_base_input"],
         )
 
-    usage_targets = build_usage_targets(parsed_input)
-    if not usage_targets:
-        return NewApiValidationResult(
-            level1_ok=True,
-            level1_msg=f"{l1['message']} ({level1_target})",
-            level2_ok=False,
-            level2_msg="未找到可校验 endpoint",
-            level3_ok=False,
-            level3_msg="未找到可校验 endpoint",
-            is_base_input=parsed_input["is_base_input"],
-        )
+    user_self_url = join_base_url(base_url, NEW_API_USER_SELF_PATH)
+    level2_ok = False
+    level2_msg = "未执行"
+    try:
+        user = fetch_new_api_user_self(base_url, user_id, api_token, timeout=timeout)
+        if parse_float(user.get("quota")) is None:
+            level2_msg = f"/api/user/self 缺少 quota 字段 ({user_self_url})"
+        else:
+            level2_ok = True
+            level2_msg = f"通过（使用 {user_self_url}）"
+    except Exception as err:
+        level2_msg = f"{err} ({user_self_url})"
 
-    token_endpoint = None
-    token_msg = "未找到可验证 token 的 endpoint"
-    probe_headers = {"User-Agent": "llm-usage-swiftbar/1.0"}
-    auth_headers = {
-        "User-Agent": "llm-usage-swiftbar/1.0",
-        "Authorization": f"Bearer {api_token}",
-    }
-    for target in usage_targets:
-        no_auth = http_probe_status(target, headers=probe_headers, timeout=timeout)
-        with_auth = http_probe_status(target, headers=auth_headers, timeout=timeout)
-        if not with_auth["reachable"]:
-            token_msg = f"请求失败: {with_auth['message']} ({target})"
-            continue
-        if with_auth["status"] in (401, 403):
-            token_msg = f"鉴权失败: HTTP {with_auth['status']} ({target})"
-            continue
-        if no_auth["status"] in (401, 403) and with_auth["status"] not in (401, 403):
-            token_endpoint = target
-            token_msg = f"通过（使用 {target}）"
-            break
-        if no_auth["status"] is None or no_auth["status"] != with_auth["status"]:
-            token_endpoint = target
-            token_msg = f"通过（状态差异验证，使用 {target}）"
-            break
-
-    level2_ok = token_endpoint is not None
-
-    usage_ok = False
-    usage_msg = "未校验"
-    usage_endpoint = None
-    usage_path = None
-    for target in usage_targets:
-        try:
-            probe_new_api_usage(target, api_token, timeout=timeout)
-            usage_ok = True
-            usage_endpoint = target
-            usage_msg = f"可解析用量字段（{target}）"
-            usage_path = derive_usage_path(parsed_input["base_url"], target)
-            break
-        except Exception as err:
-            usage_msg = f"{err} ({target})"
+    token_list_url = f"{join_base_url(base_url, NEW_API_TOKEN_LIST_PATH)}?p=1&size=50"
+    level3_ok = False
+    level3_msg = "未执行"
+    try:
+        tokens = fetch_new_api_tokens(base_url, user_id, api_token, timeout=timeout)
+        has_struct = False
+        for item in tokens:
+            if not isinstance(item, dict):
+                continue
+            if parse_float(item.get("remain_quota")) is not None:
+                has_struct = True
+                break
+        if not has_struct:
+            level3_msg = f"/api/token/ 返回数据缺少 remain_quota ({token_list_url})"
+        else:
+            level3_ok = True
+            level3_msg = f"通过（使用 {token_list_url}）"
+    except Exception as err:
+        level3_msg = f"{err} ({token_list_url})"
 
     return NewApiValidationResult(
         level1_ok=True,
         level1_msg=f"{l1['message']} ({level1_target})",
         level2_ok=level2_ok,
-        level2_msg=token_msg,
-        level3_ok=usage_ok,
-        level3_msg=usage_msg,
-        token_check_url=token_endpoint,
-        usage_check_url=usage_endpoint,
-        usage_path=usage_path,
-        is_base_input=parsed_input["is_base_input"],
+        level2_msg=level2_msg,
+        level3_ok=level3_ok,
+        level3_msg=level3_msg,
+        user_self_url=user_self_url,
+        token_list_url=token_list_url,
     )
 
 
@@ -1084,15 +1049,15 @@ def validation_summary_text(result: Optional[NewApiValidationResult]) -> str:
         return (
             "测试结果：\n"
             "🔴 一级 API 可达：未测试\n"
-            "🔴 二级 Token 可用：未测试\n"
-            "🔴 三级 用量可用：未测试"
+            "🔴 二级 /api/user/self：未测试\n"
+            "🔴 三级 /api/token/：未测试"
         )
     return "\n".join(
         [
             "测试结果：",
             format_validation_line(result.level1_ok, "一级 API 可达", result.level1_msg),
-            format_validation_line(result.level2_ok, "二级 Token 可用", result.level2_msg),
-            format_validation_line(result.level3_ok, "三级 用量可用", result.level3_msg),
+            format_validation_line(result.level2_ok, "二级 /api/user/self", result.level2_msg),
+            format_validation_line(result.level3_ok, "三级 /api/token/", result.level3_msg),
         ]
     )
 
@@ -1110,15 +1075,15 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
         "saved_payload": None,
     }
 
-    def signature(name: str, api: str, token: str) -> str:
-        return f"{name.strip()}\n{api.strip()}\n{token.strip()}"
+    def signature(name: str, api: str, user_id: str, token: str) -> str:
+        return f"{name.strip()}\n{api.strip()}\n{user_id.strip()}\n{token.strip()}"
 
     def render_waiting() -> str:
         return (
             "测试结果：\n"
             "⏳ 一级 API 可达：测试中\n"
-            "⏳ 二级 Token 可用：测试中\n"
-            "⏳ 三级 用量可用：测试中"
+            "⏳ 二级 /api/user/self：测试中\n"
+            "⏳ 三级 /api/token/：测试中"
         )
 
     def fail_result(msg: str) -> NewApiValidationResult:
@@ -1141,7 +1106,7 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
 
     title_label = tk.Label(
         frame,
-        text="同一弹窗内填写账号名称、API 链接和 API token",
+        text="同一弹窗内填写账号名称、Base URL、用户ID和用户级访问令牌",
         anchor="w",
         justify="left",
     )
@@ -1152,17 +1117,22 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
     name_entry = tk.Entry(frame, textvariable=name_var, width=54)
     name_entry.grid(row=2, column=0, columnspan=2, sticky="we", pady=(0, 8))
 
-    tk.Label(frame, text="API 链接（Base URL 或完整 Usage Endpoint）").grid(
+    tk.Label(frame, text="API 链接（Base URL）").grid(
         row=3, column=0, sticky="w"
     )
     api_var = tk.StringVar(value="https://")
     api_entry = tk.Entry(frame, textvariable=api_var, width=54)
     api_entry.grid(row=4, column=0, columnspan=2, sticky="we", pady=(0, 8))
 
-    tk.Label(frame, text="API Token").grid(row=5, column=0, sticky="w")
+    tk.Label(frame, text="用户 ID").grid(row=5, column=0, sticky="w")
+    user_id_var = tk.StringVar(value="")
+    user_id_entry = tk.Entry(frame, textvariable=user_id_var, width=54)
+    user_id_entry.grid(row=6, column=0, columnspan=2, sticky="we", pady=(0, 8))
+
+    tk.Label(frame, text="用户级系统访问令牌").grid(row=7, column=0, sticky="w")
     token_var = tk.StringVar(value="")
     token_entry = tk.Entry(frame, textvariable=token_var, width=54, show="*")
-    token_entry.grid(row=6, column=0, columnspan=2, sticky="we", pady=(0, 8))
+    token_entry.grid(row=8, column=0, columnspan=2, sticky="we", pady=(0, 8))
 
     status_var = tk.StringVar(value=validation_summary_text(None))
     status_label = tk.Label(
@@ -1172,10 +1142,10 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
         anchor="w",
         wraplength=520,
     )
-    status_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 10))
+    status_label.grid(row=9, column=0, columnspan=2, sticky="w", pady=(4, 10))
 
     button_frame = tk.Frame(frame)
-    button_frame.grid(row=8, column=0, columnspan=2, sticky="e")
+    button_frame.grid(row=10, column=0, columnspan=2, sticky="e")
 
     def update_status_from_result(result: Optional[NewApiValidationResult]) -> None:
         status_var.set(validation_summary_text(result))
@@ -1184,6 +1154,7 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
     def on_test() -> None:
         name = name_var.get().strip()
         api = api_var.get().strip()
+        user_id = user_id_var.get().strip()
         token = token_var.get().strip()
         if not name:
             result = fail_result("账号名称不能为空")
@@ -1195,12 +1166,12 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
         root.update_idletasks()
         root.update()
         try:
-            result = validate_new_api_config(api, token, timeout=10)
+            result = validate_new_api_config(api, user_id, token, timeout=10)
         except Exception as err:
             result = fail_result(str(err))
         state["last_result"] = result
         if result.all_green():
-            state["tested_signature"] = signature(name, api, token)
+            state["tested_signature"] = signature(name, api, user_id, token)
         else:
             state["tested_signature"] = None
         update_status_from_result(result)
@@ -1208,6 +1179,7 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
     def on_save() -> None:
         name = name_var.get().strip()
         api = api_var.get().strip()
+        user_id = user_id_var.get().strip()
         token = token_var.get().strip()
         if not name:
             update_status_from_result(fail_result("账号名称不能为空"))
@@ -1216,7 +1188,7 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
         if not isinstance(last_result, NewApiValidationResult) or not last_result.all_green():
             update_status_from_result(fail_result("保存前必须先测试且三级全绿"))
             return
-        current_sig = signature(name, api, token)
+        current_sig = signature(name, api, user_id, token)
         if state.get("tested_signature") != current_sig:
             update_status_from_result(fail_result("参数已变更，请重新测试"))
             return
@@ -1225,9 +1197,8 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
             "name": name,
             "api_input": api,
             "api_token": token,
+            "user_id": user_id,
             "base_url": parsed_input["base_url"],
-            "usage_path": last_result.usage_path or "",
-            "usage_endpoint": last_result.usage_check_url,
         }
         root.destroy()
 
@@ -1251,93 +1222,6 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
     return state.get("saved_payload")
 
 
-def prompt_new_api_config_legacy(account_name: str) -> Optional[Dict[str, Any]]:
-    """Legacy osascript flow retained for reference; no longer used."""
-    api_value = "https://"
-    token_value = ""
-    last_result: Optional[NewApiValidationResult] = None
-    tested_signature = None
-    while True:
-        message = (
-            f"配置 New API 账号：{account_name}\n\n"
-            "请在同一输入框按如下格式填写：\n"
-            "api=<Base URL 或完整 Usage Endpoint>\n"
-            "api_token=<Token>\n\n"
-            "点击“测试连接”执行三级校验（仅测试，不保存）。\n"
-            "仅当三级全绿时可“保存配置”。\n\n"
-            f"{validation_summary_text(last_result)}"
-        )
-        default_text = f"api={api_value}\napi_token={token_value}"
-        dialog = prompt_text_with_buttons(
-            message=message,
-            default_text=default_text,
-            buttons=["取消", "测试连接", "保存配置"],
-            default_button="测试连接",
-        )
-        if dialog is None:
-            return None
-        button = dialog["button"]
-        # 兼容旧版输入解析
-        raw_lines = [line.strip() for line in dialog["text"].splitlines() if line.strip()]
-        mapping = {}
-        for line in raw_lines:
-            if "=" in line:
-                k, v = line.split("=", 1)
-                mapping[k.strip().lower()] = v.strip()
-        api_value = mapping.get("api", api_value)
-        token_value = mapping.get("api_token", token_value)
-        current_signature = f"{api_value}\n{token_value}"
-
-        if button == "测试连接":
-            try:
-                last_result = validate_new_api_config(api_value, token_value, timeout=10)
-                if last_result.all_green():
-                    tested_signature = current_signature
-            except Exception as err:
-                last_result = NewApiValidationResult(
-                    level1_ok=False,
-                    level1_msg=str(err),
-                    level2_ok=False,
-                    level2_msg="未执行",
-                    level3_ok=False,
-                    level3_msg="未执行",
-                )
-                tested_signature = None
-            continue
-
-        if button == "保存配置":
-            if not last_result or not last_result.all_green():
-                last_result = last_result or NewApiValidationResult(
-                    level1_ok=False,
-                    level1_msg="尚未测试",
-                    level2_ok=False,
-                    level2_msg="尚未测试",
-                    level3_ok=False,
-                    level3_msg="尚未测试",
-                )
-                continue
-            if tested_signature != current_signature:
-                last_result = NewApiValidationResult(
-                    level1_ok=False,
-                    level1_msg="参数已变更，请重新测试",
-                    level2_ok=False,
-                    level2_msg="参数已变更，请重新测试",
-                    level3_ok=False,
-                    level3_msg="参数已变更，请重新测试",
-                )
-                continue
-            parsed_input = parse_new_api_api_input(api_value)
-            return {
-                "api_input": api_value,
-                "api_token": token_value,
-                "base_url": parsed_input["base_url"],
-                "usage_path": last_result.usage_path or "",
-                "usage_endpoint": last_result.usage_check_url,
-            }
-
-        raise PluginError(f"未知按钮: {button}")
-
-
 def action_add_new_api_account(config: Dict) -> None:
     config_result = prompt_new_api_config()
     if not config_result:
@@ -1355,7 +1239,7 @@ def action_add_new_api_account(config: Dict) -> None:
         "enabled": True,
         "settings": {
             "base_url": config_result["base_url"],
-            "usage_path": config_result.get("usage_path") or "",
+            "user_id": config_result.get("user_id") or "",
         },
         "auth": {
             "type": "keychain",
