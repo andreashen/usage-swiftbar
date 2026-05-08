@@ -6,6 +6,8 @@ A macOS menu bar plugin that displays usage and reset windows for multiple LLM p
 
 This repository evolved from an earlier single-provider usage plugin. It is now driven by a **multi-provider, extensible architecture** (product requirements live in `docs/spec.md`). This README only covers install and usage.
 
+> **Work in progress:** this project is still under active development and not feature-complete. Today it only has **early support for** `new_api` (other providers may be manual-window-only fallbacks; see the current implementation).
+
 ## Features
 
 ### Supported (current implementation)
