@@ -62,10 +62,6 @@ New API / Cursor / Trae.ai (example)
   Usage  ███████████           55%
   Time   ██████████████████    90%
 ─────────────────────────────
-📅 Sonnet (7d)
-  Usage                         2%
-  Time   ██████████████████    89%
-─────────────────────────────
 ⏱ 5-Hour Burst  Remaining 1h 11m
   Usage  ████████              39%
   Time   ███████████████       76%
@@ -108,9 +104,7 @@ API calls are cached for 30 minutes regardless of refresh interval to avoid rate
 ## Uninstall
 
 ```bash
-rm ~/Library/SwiftBar/llm-usage.5m.py
-rm -f ~/.local/state/llm-usage-cache.json
-rm -f ~/.config/llm-usage-swiftbar/config.json
+./uninstall.sh
 ```
 
 If you configured `new_api` tokens, they are stored in macOS Keychain. Prefer removing the account from the menu first to delete the corresponding Keychain entry.

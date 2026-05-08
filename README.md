@@ -63,10 +63,6 @@ New API / Cursor / Trae.ai（示例）
   用量  ███████████           55%
   时间  ██████████████████    90%
 ─────────────────────────────
-📅 Sonnet (7d)
-  用量                         2%
-  时间  ██████████████████    89%
-─────────────────────────────
 ⏱ 5-Hour Burst  剩余 1h 11m
   用量  ████████              39%
   时间  ███████████████       76%
@@ -109,9 +105,7 @@ New API / Cursor / Trae.ai（示例）
 ## 卸载
 
 ```bash
-rm ~/Library/SwiftBar/llm-usage.5m.py
-rm -f ~/.local/state/llm-usage-cache.json
-rm -f ~/.config/llm-usage-swiftbar/config.json
+./uninstall.sh
 ```
 
 如曾配置过 `new_api` 令牌，相关密钥存于 macOS Keychain；建议先在菜单中删除账号以清理 Keychain 条目。
