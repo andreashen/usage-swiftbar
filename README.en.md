@@ -1,23 +1,23 @@
-# LLM Usage SwiftBar Plugin (Multi-provider Planned)
+# LLM Usage SwiftBar Plugin (Multi-provider)
 
 [中文](README.md) | English
 
 A macOS menu bar plugin that displays usage and reset windows for multiple LLM platforms (remote APIs or official clients). Built for [SwiftBar](https://github.com/swiftbar/SwiftBar).
 
-This repository is an evolving fork of a Claude Code usage plugin: **today it still only supports Claude Code** (OAuth via macOS Keychain). This README has been updated to reflect the goal of becoming a generic, extensible multi-provider usage bar.
+This repository evolved from an earlier single-provider usage plugin. It is now driven by a **multi-provider, extensible architecture** (product requirements live in `docs/spec.md`). This README only covers install and usage.
 
 ## Features
 
-### Supported (current implementation: Claude Code)
+### Supported (current implementation)
 
-- **Real-time usage tracking** - Weekly (7-day), per-model (Sonnet/Opus), and 5-hour burst usage
-- **Color-coded progress bars** - 5-tier color system (green/blue/yellow/orange/red)
-- **Usage vs time progress** - Compare usage progress against time progress to decide whether to conserve or use freely
-- **Extra usage credits** - Track overage spending if enabled
-- **Smart caching** - 30-minute cache to avoid API rate limits, with manual refresh option
-- **Auto plan detection** - Displays your subscription tier (Pro, Max, Max 5x, Max 20x)
+- **Unified hierarchy** - Provider > Account > Windows (with primary account rule)
+- **Multi-account management** - Add/remove accounts, set primary account from the menu
+- **Window model** - Day / 5-hour / week / month / custom / no-reset (manual windows as a fallback)
+- **New API (official endpoints)** - Configure Base URL + User ID + user-level system access token; “Test connection” (3-level traffic light) gating before save
+- **Manual windows** - `Cursor` and `Trae.ai` can be tracked via manual utilization input for now
+- **Smart caching** - 30-minute cache with clear-cache / refresh actions
 
-### Planned (multi-provider)
+### Planned (see `docs/spec.md`)
 
 - **Unified dimensions** - Aggregate by provider + account + model/plan
 - **Pluggable providers** - Add new platforms without touching core rendering/caching
@@ -25,23 +25,16 @@ This repository is an evolving fork of a Claude Code usage plugin: **today it st
 
 ## Requirements
 
-### Current (Claude Code only)
+- **macOS** (SwiftBar is macOS-only; configuration dialogs use `osascript`)
+- **Python 3.9+**
+- **Homebrew** (used to install SwiftBar)
 
-- **macOS** (SwiftBar is macOS-only)
-- **Claude Code** with OAuth login (`claude login`)
-- **Python 3.9+** (included with macOS)
+Security & storage:
 
-> **Note:** The current version reads Claude Code OAuth credentials from macOS Keychain. It does NOT work with API key authentication (`ANTHROPIC_API_KEY`). You must be logged in via `claude login`.
-
-### Future (multi-provider)
-
-Different providers may require different auth methods (API keys, OAuth, enterprise gateways, etc.). Requirements and configuration will be documented as each provider is added.
+- **Secrets** (e.g. `new_api` access token) may be stored in **macOS Keychain**
+- **Non-sensitive config** (e.g. Base URL) is stored in a local config file
 
 ## Install
-
-### One-liner (with Claude Code)
-
-Give this repo URL to your Claude Code and ask it to install.
 
 ### Manual
 
@@ -53,18 +46,17 @@ cd usage-swiftbar
 
 The install script will:
 1. Install [SwiftBar](https://github.com/swiftbar/SwiftBar) via Homebrew (if needed)
-2. Verify your Claude Code OAuth credentials
-3. Copy the plugin to `~/Library/SwiftBar/`
-4. Start SwiftBar if not running
+2. Copy the plugin to `~/Library/SwiftBar/`
+3. Start SwiftBar if not running
 
 ## What it looks like
 
-Menu bar shows: `◆ 55%` (your weekly usage percentage, color changes with usage level)
+Menu bar shows: `◆ 55%` (primary account’s primary window utilization, color changes with usage level)
 
 Clicking reveals a dropdown with detailed breakdowns:
 
 ```
-Claude Max 5x
+New API / Cursor / Trae.ai (example)
 ─────────────────────────────
 📅 Weekly (7d)  Remaining 4d 2h
   Usage  ███████████           55%
@@ -104,12 +96,24 @@ API calls are cached for 30 minutes regardless of refresh interval to avoid rate
 
 > **Tip:** The plugin script filename now uses `llm-usage.*.py`; the refresh interval mechanism remains the same.
 
+### Configure via SwiftBar menu (no manual config editing required)
+
+- **Add account**: choose “Add account” and follow the prompts
+  - `new_api`: single dialog for name / Base URL / User ID / user-level system access token; you must “Test connection” (all green) before you can save
+  - `Cursor` / `Trae.ai`: currently tracked via “manual windows” mode as a fallback
+- **Manage accounts**: set primary account, remove account
+- **Manual windows**: add/clear windows (day / 5-hour / week / month / custom / no-reset)
+- **Cache**: clear cache and refresh
+
 ## Uninstall
 
 ```bash
 rm ~/Library/SwiftBar/llm-usage.5m.py
 rm -f ~/.local/state/llm-usage-cache.json
+rm -f ~/.config/llm-usage-swiftbar/config.json
 ```
+
+If you configured `new_api` tokens, they are stored in macOS Keychain. Prefer removing the account from the menu first to delete the corresponding Keychain entry.
 
 ## Acknowledgements
 
