@@ -1069,70 +1069,33 @@ def prompt_new_api_native_dialog(
     token_value: str,
     status_text: str,
 ) -> Optional[Dict[str, str]]:
-    """Use native macOS controls; Tk can render blank when launched by SwiftBar."""
+    """Use a basic native macOS dialog; custom accessory views render blank under SwiftBar."""
     require_macos_interactive()
+    form_text = "\n".join(
+        [
+            f"name={name_value}",
+            f"base_url={api_value}",
+            f"user_id={user_id_value}",
+            f"user_token={token_value}",
+        ]
+    )
+    message = (
+        "请按每行 key=value 填写配置：\n"
+        "name=账号名称\n"
+        "base_url=https://example.com\n"
+        "user_id=用户ID\n"
+        "user_token=用户级系统访问令牌\n\n"
+        f"{status_text}"
+    )
     script = f'''
-use framework "AppKit"
 use scripting additions
-
-set fieldWidth to 560
-set alert to current application's NSAlert's alloc()'s init()
-alert's setMessageText:"配置 New API 账号"
-alert's setInformativeText:"同一弹窗内填写账号名称、Base URL、用户 ID 和用户级访问令牌"
-alert's addButtonWithTitle:"测试连接"
-alert's addButtonWithTitle:"保存配置"
-alert's addButtonWithTitle:"取消"
-
-set accessoryView to current application's NSView's alloc()'s initWithFrame:{{{{0, 0}}, {{fieldWidth, 320}}}}
-
-set nameLabel to current application's NSTextField's labelWithString:"账号名称"
-nameLabel's setFrame:{{{{0, 292}}, {{fieldWidth, 18}}}}
-accessoryView's addSubview:nameLabel
-set nameField to current application's NSTextField's alloc()'s initWithFrame:{{{{0, 266}}, {{fieldWidth, 24}}}}
-nameField's setStringValue:"{apple_quote(name_value)}"
-accessoryView's addSubview:nameField
-
-set apiLabel to current application's NSTextField's labelWithString:"API 链接（Base URL）"
-apiLabel's setFrame:{{{{0, 236}}, {{fieldWidth, 18}}}}
-accessoryView's addSubview:apiLabel
-set apiField to current application's NSTextField's alloc()'s initWithFrame:{{{{0, 210}}, {{fieldWidth, 24}}}}
-apiField's setStringValue:"{apple_quote(api_value)}"
-accessoryView's addSubview:apiField
-
-set userLabel to current application's NSTextField's labelWithString:"用户 ID"
-userLabel's setFrame:{{{{0, 180}}, {{fieldWidth, 18}}}}
-accessoryView's addSubview:userLabel
-set userField to current application's NSTextField's alloc()'s initWithFrame:{{{{0, 154}}, {{fieldWidth, 24}}}}
-userField's setStringValue:"{apple_quote(user_id_value)}"
-accessoryView's addSubview:userField
-
-set tokenLabel to current application's NSTextField's labelWithString:"用户级系统访问令牌"
-tokenLabel's setFrame:{{{{0, 124}}, {{fieldWidth, 18}}}}
-accessoryView's addSubview:tokenLabel
-set tokenField to current application's NSSecureTextField's alloc()'s initWithFrame:{{{{0, 98}}, {{fieldWidth, 24}}}}
-tokenField's setStringValue:"{apple_quote(token_value)}"
-accessoryView's addSubview:tokenField
-
-set statusLabel to current application's NSTextField's labelWithString:"{apple_quote(status_text)}"
-statusLabel's setFrame:{{{{0, 0}}, {{fieldWidth, 84}}}}
-statusLabel's setLineBreakMode:0
-statusLabel's setUsesSingleLineMode:false
-accessoryView's addSubview:statusLabel
-
-alert's setAccessoryView:accessoryView
-set response to alert's runModal()
-if response = 1000 then
-    set buttonTitle to "测试连接"
-else if response = 1001 then
-    set buttonTitle to "保存配置"
-else
-    set buttonTitle to "取消"
-end if
-
-return buttonTitle & (ASCII character 31) & (nameField's stringValue() as text) & (ASCII character 31) & (apiField's stringValue() as text) & (ASCII character 31) & (userField's stringValue() as text) & (ASCII character 31) & (tokenField's stringValue() as text)
+set dialogResult to display dialog "{apple_quote(message)}" default answer "{apple_quote(form_text)}" buttons {{"取消", "保存配置", "测试连接"}} default button "测试连接" with title "配置 New API 账号"
+set buttonTitle to button returned of dialogResult
+set formText to text returned of dialogResult
+return buttonTitle & (ASCII character 31) & formText
 '''
     result = subprocess.run(
-        ["osascript", "-l", "AppleScript", "-e", script],
+        ["osascript", "-e", script],
         capture_output=True,
         text=True,
     )
@@ -1140,16 +1103,27 @@ return buttonTitle & (ASCII character 31) & (nameField's stringValue() as text) 
         if "(-128)" in (result.stderr or ""):
             return None
         raise PluginError(result.stderr.strip() or "配置弹窗打开失败")
-    parts = result.stdout.rstrip("\n").split(chr(31))
-    if len(parts) != 5:
+    parts = result.stdout.rstrip("\n").split(chr(31), 1)
+    if len(parts) != 2:
         raise PluginError("配置弹窗结果解析失败")
+    values = parse_key_value_form(parts[1])
     return {
-        "button": parts[0],
-        "name": parts[1].strip(),
-        "api": parts[2].strip(),
-        "user_id": parts[3].strip(),
-        "token": parts[4].strip(),
+        "button": parts[0].strip(),
+        "name": values.get("name", ""),
+        "api": values.get("base_url") or values.get("api", ""),
+        "user_id": values.get("user_id", ""),
+        "token": values.get("user_token") or values.get("api_token") or values.get("token", ""),
     }
+
+
+def parse_key_value_form(text: str) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip().lower()] = value.strip()
+    return values
 
 
 def prompt_new_api_config() -> Optional[Dict[str, Any]]:
