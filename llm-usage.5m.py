@@ -1062,20 +1062,97 @@ def validation_summary_text(result: Optional[NewApiValidationResult]) -> str:
     )
 
 
-def prompt_new_api_config() -> Optional[Dict[str, Any]]:
+def prompt_new_api_native_dialog(
+    name_value: str,
+    api_value: str,
+    user_id_value: str,
+    token_value: str,
+    status_text: str,
+) -> Optional[Dict[str, str]]:
+    """Use native macOS controls; Tk can render blank when launched by SwiftBar."""
     require_macos_interactive()
-    try:
-        import tkinter as tk
-        from tkinter import ttk
-    except Exception as err:
-        raise PluginError(f"无法加载图形窗口: {err}")
+    script = f'''
+use framework "AppKit"
+use scripting additions
 
-    state: Dict[str, Any] = {
-        "last_result": None,
-        "tested_signature": None,
-        "saved_payload": None,
+set fieldWidth to 560
+set alert to current application's NSAlert's alloc()'s init()
+alert's setMessageText:"配置 New API 账号"
+alert's setInformativeText:"同一弹窗内填写账号名称、Base URL、用户 ID 和用户级访问令牌"
+alert's addButtonWithTitle:"测试连接"
+alert's addButtonWithTitle:"保存配置"
+alert's addButtonWithTitle:"取消"
+
+set accessoryView to current application's NSView's alloc()'s initWithFrame:{{{{0, 0}}, {{fieldWidth, 320}}}}
+
+set nameLabel to current application's NSTextField's labelWithString:"账号名称"
+nameLabel's setFrame:{{{{0, 292}}, {{fieldWidth, 18}}}}
+accessoryView's addSubview:nameLabel
+set nameField to current application's NSTextField's alloc()'s initWithFrame:{{{{0, 266}}, {{fieldWidth, 24}}}}
+nameField's setStringValue:"{apple_quote(name_value)}"
+accessoryView's addSubview:nameField
+
+set apiLabel to current application's NSTextField's labelWithString:"API 链接（Base URL）"
+apiLabel's setFrame:{{{{0, 236}}, {{fieldWidth, 18}}}}
+accessoryView's addSubview:apiLabel
+set apiField to current application's NSTextField's alloc()'s initWithFrame:{{{{0, 210}}, {{fieldWidth, 24}}}}
+apiField's setStringValue:"{apple_quote(api_value)}"
+accessoryView's addSubview:apiField
+
+set userLabel to current application's NSTextField's labelWithString:"用户 ID"
+userLabel's setFrame:{{{{0, 180}}, {{fieldWidth, 18}}}}
+accessoryView's addSubview:userLabel
+set userField to current application's NSTextField's alloc()'s initWithFrame:{{{{0, 154}}, {{fieldWidth, 24}}}}
+userField's setStringValue:"{apple_quote(user_id_value)}"
+accessoryView's addSubview:userField
+
+set tokenLabel to current application's NSTextField's labelWithString:"用户级系统访问令牌"
+tokenLabel's setFrame:{{{{0, 124}}, {{fieldWidth, 18}}}}
+accessoryView's addSubview:tokenLabel
+set tokenField to current application's NSSecureTextField's alloc()'s initWithFrame:{{{{0, 98}}, {{fieldWidth, 24}}}}
+tokenField's setStringValue:"{apple_quote(token_value)}"
+accessoryView's addSubview:tokenField
+
+set statusLabel to current application's NSTextField's labelWithString:"{apple_quote(status_text)}"
+statusLabel's setFrame:{{{{0, 0}}, {{fieldWidth, 84}}}}
+statusLabel's setLineBreakMode:0
+statusLabel's setUsesSingleLineMode:false
+accessoryView's addSubview:statusLabel
+
+alert's setAccessoryView:accessoryView
+set response to alert's runModal()
+if response = 1000 then
+    set buttonTitle to "测试连接"
+else if response = 1001 then
+    set buttonTitle to "保存配置"
+else
+    set buttonTitle to "取消"
+end if
+
+return buttonTitle & (ASCII character 31) & (nameField's stringValue() as text) & (ASCII character 31) & (apiField's stringValue() as text) & (ASCII character 31) & (userField's stringValue() as text) & (ASCII character 31) & (tokenField's stringValue() as text)
+'''
+    result = subprocess.run(
+        ["osascript", "-l", "AppleScript", "-e", script],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        if "(-128)" in (result.stderr or ""):
+            return None
+        raise PluginError(result.stderr.strip() or "配置弹窗打开失败")
+    parts = result.stdout.rstrip("\n").split(chr(31))
+    if len(parts) != 5:
+        raise PluginError("配置弹窗结果解析失败")
+    return {
+        "button": parts[0],
+        "name": parts[1].strip(),
+        "api": parts[2].strip(),
+        "user_id": parts[3].strip(),
+        "token": parts[4].strip(),
     }
 
+
+def prompt_new_api_config() -> Optional[Dict[str, Any]]:
     def signature(name: str, api: str, user_id: str, token: str) -> str:
         return f"{name.strip()}\n{api.strip()}\n{user_id.strip()}\n{token.strip()}"
 
@@ -1097,131 +1174,65 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
             level3_msg="未执行",
         )
 
-    root = tk.Tk()
-    root.title("配置 New API 账号")
-    root.geometry("620x430")
-    root.minsize(620, 430)
-    root.resizable(False, False)
-    root.attributes("-topmost", True)
+    name = ""
+    api = "https://"
+    user_id = ""
+    token = ""
+    last_result: Optional[NewApiValidationResult] = None
+    tested_signature = None
 
-    outer = ttk.Frame(root, padding=(18, 14, 18, 14))
-    outer.pack(fill="both", expand=True)
+    while True:
+        dialog = prompt_new_api_native_dialog(
+            name,
+            api,
+            user_id,
+            token,
+            validation_summary_text(last_result),
+        )
+        if dialog is None or dialog["button"] == "取消":
+            return None
 
-    title_label = ttk.Label(
-        outer,
-        text="同一弹窗内填写账号名称、Base URL、用户 ID 和用户级访问令牌",
-        anchor="w",
-        justify="left",
-    )
-    title_label.pack(fill="x", pady=(0, 12))
+        name = dialog["name"]
+        api = dialog["api"]
+        user_id = dialog["user_id"]
+        token = dialog["token"]
 
-    form_frame = ttk.Frame(outer)
-    form_frame.pack(fill="x")
+        if dialog["button"] == "测试连接":
+            if not name:
+                last_result = fail_result("账号名称不能为空")
+                tested_signature = None
+                continue
+            notify("New API 测试连接中...")
+            try:
+                last_result = validate_new_api_config(api, user_id, token, timeout=10)
+            except Exception as err:
+                last_result = fail_result(str(err))
+            if last_result.all_green():
+                tested_signature = signature(name, api, user_id, token)
+            else:
+                tested_signature = None
+            continue
 
-    def add_field(label: str, variable: tk.StringVar, show: Optional[str] = None) -> ttk.Entry:
-        ttk.Label(form_frame, text=label, anchor="w").pack(fill="x")
-        entry = ttk.Entry(form_frame, textvariable=variable, show=show)
-        entry.pack(fill="x", pady=(2, 10))
-        return entry
+        if dialog["button"] == "保存配置":
+            if not name:
+                last_result = fail_result("账号名称不能为空")
+                continue
+            if not last_result or not last_result.all_green():
+                last_result = fail_result("保存前必须先测试且三级全绿")
+                continue
+            if tested_signature != signature(name, api, user_id, token):
+                last_result = fail_result("参数已变更，请重新测试")
+                continue
+            parsed_input = parse_new_api_api_input(api)
+            return {
+                "name": name,
+                "api_input": api,
+                "api_token": token,
+                "user_id": user_id,
+                "base_url": parsed_input["base_url"],
+            }
 
-    name_var = tk.StringVar(value="")
-    api_var = tk.StringVar(value="https://")
-    user_id_var = tk.StringVar(value="")
-    token_var = tk.StringVar(value="")
-
-    name_entry = add_field("账号名称", name_var)
-    add_field("API 链接（Base URL）", api_var)
-    add_field("用户 ID", user_id_var)
-    add_field("用户级系统访问令牌", token_var, show="*")
-
-    status_var = tk.StringVar(value=validation_summary_text(None))
-    status_label = ttk.Label(
-        outer,
-        textvariable=status_var,
-        justify="left",
-        anchor="w",
-        wraplength=560,
-    )
-    status_label.pack(fill="x", pady=(6, 10))
-
-    button_frame = ttk.Frame(outer)
-    button_frame.pack(side="bottom", fill="x")
-
-    def update_status_from_result(result: Optional[NewApiValidationResult]) -> None:
-        status_var.set(validation_summary_text(result))
-        root.update_idletasks()
-
-    def on_test() -> None:
-        name = name_var.get().strip()
-        api = api_var.get().strip()
-        user_id = user_id_var.get().strip()
-        token = token_var.get().strip()
-        if not name:
-            result = fail_result("账号名称不能为空")
-            state["last_result"] = result
-            state["tested_signature"] = None
-            update_status_from_result(result)
-            return
-        status_var.set(render_waiting())
-        root.update_idletasks()
-        root.update()
-        try:
-            result = validate_new_api_config(api, user_id, token, timeout=10)
-        except Exception as err:
-            result = fail_result(str(err))
-        state["last_result"] = result
-        if result.all_green():
-            state["tested_signature"] = signature(name, api, user_id, token)
-        else:
-            state["tested_signature"] = None
-        update_status_from_result(result)
-
-    def on_save() -> None:
-        name = name_var.get().strip()
-        api = api_var.get().strip()
-        user_id = user_id_var.get().strip()
-        token = token_var.get().strip()
-        if not name:
-            update_status_from_result(fail_result("账号名称不能为空"))
-            return
-        last_result = state.get("last_result")
-        if not isinstance(last_result, NewApiValidationResult) or not last_result.all_green():
-            update_status_from_result(fail_result("保存前必须先测试且三级全绿"))
-            return
-        current_sig = signature(name, api, user_id, token)
-        if state.get("tested_signature") != current_sig:
-            update_status_from_result(fail_result("参数已变更，请重新测试"))
-            return
-        parsed_input = parse_new_api_api_input(api)
-        state["saved_payload"] = {
-            "name": name,
-            "api_input": api,
-            "api_token": token,
-            "user_id": user_id,
-            "base_url": parsed_input["base_url"],
-        }
-        root.destroy()
-
-    def on_cancel() -> None:
-        state["saved_payload"] = None
-        root.destroy()
-
-    cancel_btn = ttk.Button(button_frame, text="取消", command=on_cancel, width=12)
-    cancel_btn.pack(side="right")
-    save_btn = ttk.Button(button_frame, text="保存配置", command=on_save, width=12)
-    save_btn.pack(side="right", padx=(0, 10))
-    test_btn = ttk.Button(button_frame, text="测试连接", command=on_test, width=12)
-    test_btn.pack(side="right", padx=(0, 10))
-
-    def on_close() -> None:
-        on_cancel()
-
-    root.protocol("WM_DELETE_WINDOW", on_close)
-    root.update_idletasks()
-    root.lift()
-    name_entry.focus_set()
-    root.mainloop()
-    return state.get("saved_payload")
+        raise PluginError(f"未知按钮: {dialog['button']}")
 
 
 def action_add_new_api_account(config: Dict) -> None:
