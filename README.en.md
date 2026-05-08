@@ -94,21 +94,21 @@ Refresh now
 
 ## Configuration
 
-The plugin refreshes every 5 minutes (configured via the filename `claude-usage.5m.py`). To change the refresh interval, rename the file:
+The plugin refreshes every 5 minutes (configured via the filename `llm-usage.5m.py`). To change the refresh interval, rename the file:
 
-- `claude-usage.1m.py` - Every minute
-- `claude-usage.10m.py` - Every 10 minutes
-- `claude-usage.30m.py` - Every 30 minutes
+- `llm-usage.1m.py` - Every minute
+- `llm-usage.10m.py` - Every 10 minutes
+- `llm-usage.30m.py` - Every 30 minutes
 
 API calls are cached for 30 minutes regardless of refresh interval to avoid rate limiting. You can click "Refresh now" to force a fresh API call when the cache expires.
 
-> **Tip:** The plugin script filename is currently still `claude-usage.*.py`. It may be renamed to something more generic as the multi-provider refactor lands, but the refresh interval mechanism remains the same.
+> **Tip:** The plugin script filename now uses `llm-usage.*.py`; the refresh interval mechanism remains the same.
 
 ## Uninstall
 
 ```bash
-rm ~/Library/SwiftBar/claude-usage.5m.py
-rm -f ~/.local/state/claude-usage-cache.json
+rm ~/Library/SwiftBar/llm-usage.5m.py
+rm -f ~/.local/state/llm-usage-cache.json
 ```
 
 ## Acknowledgements
