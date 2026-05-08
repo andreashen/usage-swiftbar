@@ -1066,6 +1066,7 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
     require_macos_interactive()
     try:
         import tkinter as tk
+        from tkinter import ttk
     except Exception as err:
         raise PluginError(f"无法加载图形窗口: {err}")
 
@@ -1098,54 +1099,53 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
 
     root = tk.Tk()
     root.title("配置 New API 账号")
+    root.geometry("620x430")
+    root.minsize(620, 430)
     root.resizable(False, False)
     root.attributes("-topmost", True)
 
-    frame = tk.Frame(root, padx=14, pady=12)
-    frame.grid(row=0, column=0, sticky="nsew")
+    outer = ttk.Frame(root, padding=(18, 14, 18, 14))
+    outer.pack(fill="both", expand=True)
 
-    title_label = tk.Label(
-        frame,
-        text="同一弹窗内填写账号名称、Base URL、用户ID和用户级访问令牌",
+    title_label = ttk.Label(
+        outer,
+        text="同一弹窗内填写账号名称、Base URL、用户 ID 和用户级访问令牌",
         anchor="w",
         justify="left",
     )
-    title_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+    title_label.pack(fill="x", pady=(0, 12))
 
-    tk.Label(frame, text="账号名称").grid(row=1, column=0, sticky="w")
+    form_frame = ttk.Frame(outer)
+    form_frame.pack(fill="x")
+
+    def add_field(label: str, variable: tk.StringVar, show: Optional[str] = None) -> ttk.Entry:
+        ttk.Label(form_frame, text=label, anchor="w").pack(fill="x")
+        entry = ttk.Entry(form_frame, textvariable=variable, show=show)
+        entry.pack(fill="x", pady=(2, 10))
+        return entry
+
     name_var = tk.StringVar(value="")
-    name_entry = tk.Entry(frame, textvariable=name_var, width=54)
-    name_entry.grid(row=2, column=0, columnspan=2, sticky="we", pady=(0, 8))
-
-    tk.Label(frame, text="API 链接（Base URL）").grid(
-        row=3, column=0, sticky="w"
-    )
     api_var = tk.StringVar(value="https://")
-    api_entry = tk.Entry(frame, textvariable=api_var, width=54)
-    api_entry.grid(row=4, column=0, columnspan=2, sticky="we", pady=(0, 8))
-
-    tk.Label(frame, text="用户 ID").grid(row=5, column=0, sticky="w")
     user_id_var = tk.StringVar(value="")
-    user_id_entry = tk.Entry(frame, textvariable=user_id_var, width=54)
-    user_id_entry.grid(row=6, column=0, columnspan=2, sticky="we", pady=(0, 8))
-
-    tk.Label(frame, text="用户级系统访问令牌").grid(row=7, column=0, sticky="w")
     token_var = tk.StringVar(value="")
-    token_entry = tk.Entry(frame, textvariable=token_var, width=54, show="*")
-    token_entry.grid(row=8, column=0, columnspan=2, sticky="we", pady=(0, 8))
+
+    name_entry = add_field("账号名称", name_var)
+    add_field("API 链接（Base URL）", api_var)
+    add_field("用户 ID", user_id_var)
+    add_field("用户级系统访问令牌", token_var, show="*")
 
     status_var = tk.StringVar(value=validation_summary_text(None))
-    status_label = tk.Label(
-        frame,
+    status_label = ttk.Label(
+        outer,
         textvariable=status_var,
         justify="left",
         anchor="w",
-        wraplength=520,
+        wraplength=560,
     )
-    status_label.grid(row=9, column=0, columnspan=2, sticky="w", pady=(4, 10))
+    status_label.pack(fill="x", pady=(6, 10))
 
-    button_frame = tk.Frame(frame)
-    button_frame.grid(row=10, column=0, columnspan=2, sticky="e")
+    button_frame = ttk.Frame(outer)
+    button_frame.pack(side="bottom", fill="x")
 
     def update_status_from_result(result: Optional[NewApiValidationResult]) -> None:
         status_var.set(validation_summary_text(result))
@@ -1206,17 +1206,19 @@ def prompt_new_api_config() -> Optional[Dict[str, Any]]:
         state["saved_payload"] = None
         root.destroy()
 
-    test_btn = tk.Button(button_frame, text="测试连接", command=on_test, width=11)
-    test_btn.grid(row=0, column=0, padx=(0, 8))
-    save_btn = tk.Button(button_frame, text="保存配置", command=on_save, width=11)
-    save_btn.grid(row=0, column=1, padx=(0, 8))
-    cancel_btn = tk.Button(button_frame, text="取消", command=on_cancel, width=11)
-    cancel_btn.grid(row=0, column=2)
+    cancel_btn = ttk.Button(button_frame, text="取消", command=on_cancel, width=12)
+    cancel_btn.pack(side="right")
+    save_btn = ttk.Button(button_frame, text="保存配置", command=on_save, width=12)
+    save_btn.pack(side="right", padx=(0, 10))
+    test_btn = ttk.Button(button_frame, text="测试连接", command=on_test, width=12)
+    test_btn.pack(side="right", padx=(0, 10))
 
     def on_close() -> None:
         on_cancel()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
+    root.update_idletasks()
+    root.lift()
     name_entry.focus_set()
     root.mainloop()
     return state.get("saved_payload")
