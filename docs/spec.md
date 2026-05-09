@@ -14,8 +14,9 @@ README 仅用于安装与使用说明，不承载需求讨论。
 ### 3.1 当前目标平台
 
 1. `new_api` 类第三方 token 供应商（优先）
-2. `Cursor`
-3. `Trae.ai`
+2. `OpenRouter`（management key 模式）
+3. `Cursor`
+4. `Trae.ai`
 
 ### 3.2 接入策略
 
@@ -141,13 +142,76 @@ README 仅用于安装与使用说明，不承载需求讨论。
 
 - `status=1` 视为已启用；即使过期也仍需展示。
 
-## 9. 非目标（当前阶段）
+## 9. `OpenRouter` 接入要求（management key）
+
+### 9.1 数据源与鉴权
+
+`OpenRouter` 账号使用 management key 鉴权，固定接口为：
+
+1. `GET https://openrouter.ai/api/v1/key`
+2. `GET https://openrouter.ai/api/v1/credits`
+3. `GET https://openrouter.ai/api/v1/keys`
+
+统一鉴权头：
+
+- `Authorization: Bearer <management key>`
+
+说明：
+
+- management key 在本项目中的角色等价于 `new_api` 的“用户级系统访问令牌”。
+- 不要求额外配置 `workspace_id`。
+
+### 9.2 配置交互（单弹窗）
+
+- 该约束仅适用于 `openrouter`。
+- 新增账号必须在同一弹窗输入：
+  - 账号名称
+  - management key
+- 单弹窗提供：
+  - `测试连接` 按钮（只测试，不保存）
+  - `保存配置` 按钮
+
+### 9.3 三级校验（红绿灯）
+
+测试连接必须输出三级结果（🟢/🔴）：
+
+1. **一级：API 可达**
+   - `https://openrouter.ai` 可收到 HTTP 状态码即视为可达。
+2. **二级：`/api/v1/key` 可用且 key 类型正确**
+   - 使用 management key 访问该接口，且返回字段 `is_management_key = true`。
+3. **三级：`/api/v1/keys` 可用**
+   - 能访问 key 列表接口并解析出 key 列表结构（至少包含 `disabled` 字段）。
+
+保存门禁：
+
+- 仅当三级全绿才允许保存。
+
+### 9.4 展示要求
+
+每个 `openrouter` 账号展示：
+
+1. **钱包余额**
+   - 基于 `total_credits` 与 `total_usage` 计算：
+   - `remaining = total_credits - total_usage`（单位 USD）
+2. **每个启用中的 key（`disabled = false`）**
+   - 名称（`name`，缺失时可回退 `label`）
+   - 剩余额度（`limit_remaining`，USD）
+   - 总额度（`limit`，USD）
+   - 过期时间（`expires_at`）
+   - 限额重置策略（`limit_reset`）
+
+说明：
+
+- 仅按 `disabled = false` 过滤；其余状态不额外过滤。
+- 以接口原始 USD 单位展示，不做汇率或额度单位换算。
+
+## 10. 非目标（当前阶段）
 
 - 不优先实现基于非官方接口的稳定自动采集。
 - 不优先实现本地日志解析链路。
 - 不要求恢复或优先维护旧的 Claude Code 专用路径。
 
-## 10. 迭代原则
+## 11. 迭代原则
 
 - 以“可扩展性”和“贡献者易接入”为第一优先。
 - 每次新增平台或能力时，先补充本 spec，再实现代码与 README 使用说明。

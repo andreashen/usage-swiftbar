@@ -6,7 +6,7 @@ A macOS menu bar plugin that displays usage and reset windows for multiple LLM p
 
 This repository evolved from an earlier single-provider usage plugin. It is now driven by a **multi-provider, extensible architecture** (product requirements live in `docs/spec.md`). This README only covers install and usage.
 
-> **Work in progress:** this project is still under active development and not feature-complete. Today it only has **early support for** `new_api` (other providers may be manual-window-only fallbacks; see the current implementation).
+> **Work in progress:** this project is still under active development and not feature-complete. It currently supports official integrations for `new_api` and `openrouter` (other providers may still be manual-window-only fallbacks; see the current implementation).
 
 ## Features
 
@@ -16,6 +16,7 @@ This repository evolved from an earlier single-provider usage plugin. It is now 
 - **Multi-account management** - Add/remove accounts, set primary account from the menu
 - **Window model** - Day / 5-hour / week / month / custom / no-reset (manual windows as a fallback)
 - **New API (official endpoints)** - Configure Base URL + User ID + user-level system access token; “Test connection” (3-level traffic light) gating before save
+- **OpenRouter (management key)** - Configure a management key; save is gated by “Test connection” (3-level traffic light); shows remaining credits and enabled keys (`disabled=false`)
 - **Manual windows** - `Cursor` and `Trae.ai` can be tracked via manual utilization input for now
 - **Smart caching** - 30-minute cache with clear-cache / refresh actions
 
@@ -33,7 +34,7 @@ This repository evolved from an earlier single-provider usage plugin. It is now 
 
 Security & storage:
 
-- **Secrets** (e.g. `new_api` access token) may be stored in **macOS Keychain**
+- **Secrets** (e.g. `new_api` access token, `openrouter` management key) may be stored in **macOS Keychain**
 - **Non-sensitive config** (e.g. Base URL) is stored in a local config file
 
 ## Install
@@ -98,6 +99,7 @@ API calls are cached for 30 minutes regardless of refresh interval to avoid rate
 
 - **Add account**: choose “Add account” and follow the prompts
   - `new_api`: single dialog for name / Base URL / User ID / user-level system access token; you must “Test connection” (all green) before you can save
+  - `openrouter`: single dialog for name / management key; you must “Test connection” (all green) before you can save
   - `Cursor` / `Trae.ai`: currently tracked via “manual windows” mode as a fallback
 - **Manage accounts**: set primary account, remove account
 - **Manual windows**: add/clear windows (day / 5-hour / week / month / custom / no-reset)
@@ -109,7 +111,7 @@ API calls are cached for 30 minutes regardless of refresh interval to avoid rate
 ./uninstall.sh
 ```
 
-If you configured `new_api` tokens, they are stored in macOS Keychain. Prefer removing the account from the menu first to delete the corresponding Keychain entry.
+If you configured `new_api` tokens or an `openrouter` management key, they are stored in macOS Keychain. Prefer removing the account from the menu first to delete the corresponding Keychain entry.
 
 ## Acknowledgements
 
