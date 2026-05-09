@@ -310,7 +310,7 @@ ADAPTERS = {
 
 
 def load_config() -> Dict:
-    default = {"version": 1, "primary_account_id": None, "accounts": []}
+    default = {"version": 1, "primary_account_id": None, "accounts": [], "bar_display": "primary"}
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
@@ -327,6 +327,8 @@ def load_config() -> Dict:
         raw["primary_account_id"] = None
     if "version" not in raw:
         raw["version"] = 1
+    if raw.get("bar_display") not in ("primary", "aggregate_usd"):
+        raw["bar_display"] = "primary"
     return raw
 
 
@@ -488,6 +490,20 @@ def primary_utilization(usage: Optional[AccountUsage]) -> Optional[float]:
     return None
 
 
+def sum_aggregate_wallet_usd(usages: List[AccountUsage]) -> float:
+    total = 0.0
+    for usage in usages:
+        details = usage.details or {}
+        user = details.get("user")
+        if not isinstance(user, dict):
+            continue
+        quota = parse_float(user.get("quota"))
+        if quota is None:
+            continue
+        total += quota_to_usd(quota)
+    return total
+
+
 def render_no_config() -> None:
     print("◆ 配置 | color=#3B82F6 font=Menlo")
     print("---")
@@ -500,11 +516,16 @@ def render_no_config() -> None:
 
 def render_menu(config: Dict, usages: List[AccountUsage], cache_age: Optional[float]) -> None:
     primary = choose_primary_usage(config, usages)
-    util = primary_utilization(primary)
-    if util is None:
-        print("◆ -- | color=#9CA3AF font=Menlo")
+    bar_mode = config.get("bar_display", "primary")
+    if bar_mode == "aggregate_usd":
+        total_usd = sum_aggregate_wallet_usd(usages)
+        print(f"◆ {format_usd(total_usd)} | color=#22C55E font=Menlo")
     else:
-        print(f"◆ {int(util)}% | color={usage_color(util/100)} font=Menlo")
+        util = primary_utilization(primary)
+        if util is None:
+            print("◆ -- | color=#9CA3AF font=Menlo")
+        else:
+            print(f"◆ {int(util)}% | color={usage_color(util/100)} font=Menlo")
 
     print("---")
     if primary:
@@ -512,6 +533,11 @@ def render_menu(config: Dict, usages: List[AccountUsage], cache_age: Optional[fl
         print(f"主账号: {primary.account_name} ({provider_name}) | size=12 {NOOP}")
     else:
         print(f"主账号: 未设置 | size=12 {NOOP}")
+    print("---")
+    mark_primary = "✓ " if bar_mode == "primary" else ""
+    mark_agg = "✓ " if bar_mode == "aggregate_usd" else ""
+    print(f"{mark_primary}状态栏：主账号用量 % | size=11 {swiftbar_action_attrs('bar-display-primary')}")
+    print(f"{mark_agg}状态栏：全部余额合计 (USD) | size=11 {swiftbar_action_attrs('bar-display-aggregate-usd')}")
     print("---")
 
     grouped = group_by_provider(usages)
@@ -1415,6 +1441,18 @@ def action_clear_cache() -> None:
     notify("缓存已清空")
 
 
+def action_bar_display(mode: str) -> None:
+    if mode not in ("primary", "aggregate_usd"):
+        raise PluginError("无效的菜单栏显示模式")
+    config = load_config()
+    config["bar_display"] = mode
+    save_config(config)
+    if mode == "aggregate_usd":
+        notify("菜单栏已切换为全部余额合计 (USD)")
+    else:
+        notify("菜单栏已切换为主账号用量百分比")
+
+
 def run_action(action: str, account_id: Optional[str]) -> None:
     if action == "add-account":
         action_add_account()
@@ -1441,6 +1479,12 @@ def run_action(action: str, account_id: Optional[str]) -> None:
         return
     if action == "clear-cache":
         action_clear_cache()
+        return
+    if action == "bar-display-primary":
+        action_bar_display("primary")
+        return
+    if action == "bar-display-aggregate-usd":
+        action_bar_display("aggregate_usd")
         return
     raise PluginError(f"未知 action: {action}")
 
