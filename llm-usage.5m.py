@@ -31,6 +31,7 @@ NOOP = "bash=/usr/bin/true terminal=false"
 
 PROVIDER_LABELS = {
     "new_api": "New API",
+    "openrouter": "OpenRouter",
     "cursor": "Cursor",
     "trae": "Trae.ai",
 }
@@ -56,6 +57,10 @@ CATEGORY_ORDER = {
 NEW_API_USER_SELF_PATH = "/api/user/self"
 NEW_API_TOKEN_LIST_PATH = "/api/token/"
 QUOTA_PER_USD = 500000.0
+OPENROUTER_BASE_URL = "https://openrouter.ai"
+OPENROUTER_CURRENT_KEY_PATH = "/api/v1/key"
+OPENROUTER_CREDITS_PATH = "/api/v1/credits"
+OPENROUTER_KEYS_PATH = "/api/v1/keys"
 
 
 class PluginError(RuntimeError):
@@ -97,6 +102,21 @@ class NewApiValidationResult:
         return self.level1_ok and self.level2_ok and self.level3_ok
 
 
+@dataclass
+class OpenRouterValidationResult:
+    level1_ok: bool
+    level1_msg: str
+    level2_ok: bool
+    level2_msg: str
+    level3_ok: bool
+    level3_msg: str
+    key_info_url: Optional[str] = None
+    key_list_url: Optional[str] = None
+
+    def all_green(self) -> bool:
+        return self.level1_ok and self.level2_ok and self.level3_ok
+
+
 class ProviderAdapter:
     provider_name = ""
 
@@ -131,6 +151,25 @@ class NewApiProviderAdapter(ProviderAdapter):
     def fetch(self, account: Dict) -> AccountUsage:
         details = fetch_new_api_account_details(account)
         windows = details_to_windows(details)
+        if not windows:
+            windows = load_manual_windows(account)
+        if not windows:
+            raise PluginError("未识别到远程数据，且未配置手工窗口")
+        return AccountUsage(
+            account_id=account["id"],
+            provider=account["provider"],
+            account_name=account["name"],
+            windows=windows,
+            details=details,
+        )
+
+
+class OpenRouterProviderAdapter(ProviderAdapter):
+    provider_name = "openrouter"
+
+    def fetch(self, account: Dict) -> AccountUsage:
+        details = fetch_openrouter_account_details(account)
+        windows = openrouter_details_to_windows(details)
         if not windows:
             windows = load_manual_windows(account)
         if not windows:
@@ -302,8 +341,109 @@ def fetch_new_api_account_details(account: Dict) -> Dict[str, Any]:
         )
     return {"user": user, "tokens": token_cards}
 
+
+def openrouter_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "llm-usage-swiftbar/1.0",
+    }
+
+
+def fetch_openrouter_current_key(base_url: str, token: str, timeout: int = 10) -> Dict[str, Any]:
+    url = join_base_url(base_url, OPENROUTER_CURRENT_KEY_PATH)
+    payload = http_get_json_allow_query(url, headers=openrouter_headers(token), timeout=timeout)
+    data = extract_success_payload(payload, url)
+    if not isinstance(data, dict):
+        raise PluginError("/api/v1/key data 结构异常")
+    return data
+
+
+def fetch_openrouter_credits(base_url: str, token: str, timeout: int = 10) -> Dict[str, Any]:
+    url = join_base_url(base_url, OPENROUTER_CREDITS_PATH)
+    payload = http_get_json_allow_query(url, headers=openrouter_headers(token), timeout=timeout)
+    data = extract_success_payload(payload, url)
+    if not isinstance(data, dict):
+        raise PluginError("/api/v1/credits data 结构异常")
+    return data
+
+
+def fetch_openrouter_keys(base_url: str, token: str, timeout: int = 10) -> List[Dict[str, Any]]:
+    url = join_base_url(base_url, OPENROUTER_KEYS_PATH)
+    payload = http_get_json_allow_query(url, headers=openrouter_headers(token), timeout=timeout)
+    data = extract_success_payload(payload, url)
+    if not isinstance(data, list):
+        raise PluginError("/api/v1/keys data 结构异常")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def openrouter_remaining_credits(credits: Dict[str, Any]) -> float:
+    total = parse_float(credits.get("total_credits")) or 0.0
+    used = parse_float(credits.get("total_usage")) or 0.0
+    return max(total - used, 0.0)
+
+
+def normalize_openrouter_datetime(value: Any) -> str:
+    if not value:
+        return "--"
+    dt = parse_iso8601(str(value))
+    if dt is None:
+        return str(value)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def openrouter_details_to_windows(details: Dict[str, Any]) -> List[WindowUsage]:
+    credits = details.get("credits", {})
+    if not isinstance(credits, dict):
+        credits = {}
+    total = parse_float(credits.get("total_credits")) or 0.0
+    used = parse_float(credits.get("total_usage")) or 0.0
+    util = 0.0
+    if total > 0:
+        util = min(max((used / total) * 100.0, 0.0), 100.0)
+    remaining = openrouter_remaining_credits(credits)
+    return [
+        WindowUsage(
+            category="month",
+            label="余额(USD)",
+            utilization=util,
+            note=f"余额 {format_usd(remaining)}",
+        )
+    ]
+
+
+def fetch_openrouter_account_details(account: Dict) -> Dict[str, Any]:
+    settings = account.get("settings", {})
+    base_url = (settings.get("base_url") or OPENROUTER_BASE_URL).strip() or OPENROUTER_BASE_URL
+    token = load_account_api_key(account)
+    if not token:
+        raise PluginError("缺少 management key")
+
+    key_info = fetch_openrouter_current_key(base_url, token, timeout=10)
+    credits = fetch_openrouter_credits(base_url, token, timeout=10)
+    keys = fetch_openrouter_keys(base_url, token, timeout=10)
+
+    key_cards = []
+    for item in keys:
+        if parse_bool(item.get("disabled")):
+            continue
+        key_cards.append(
+            {
+                "name": item.get("name") or item.get("label") or f"Key-{item.get('hash', '')}",
+                "limit_remaining": parse_float(item.get("limit_remaining")),
+                "limit": parse_float(item.get("limit")),
+                "usage": parse_float(item.get("usage")),
+                "expires_at": normalize_openrouter_datetime(item.get("expires_at")),
+                "limit_reset": item.get("limit_reset") or "不重置",
+            }
+        )
+    return {"key_info": key_info, "credits": credits, "keys": key_cards}
+
+
 ADAPTERS = {
     "new_api": NewApiProviderAdapter(),
+    "openrouter": OpenRouterProviderAdapter(),
     "cursor": CursorProviderAdapter(),
     "trae": TraeProviderAdapter(),
 }
@@ -494,6 +634,10 @@ def sum_aggregate_wallet_usd(usages: List[AccountUsage]) -> float:
     total = 0.0
     for usage in usages:
         details = usage.details or {}
+        credits = details.get("credits")
+        if isinstance(credits, dict):
+            total += openrouter_remaining_credits(credits)
+            continue
         user = details.get("user")
         if not isinstance(user, dict):
             continue
@@ -550,6 +694,8 @@ def render_menu(config: Dict, usages: List[AccountUsage], cache_age: Optional[fl
                 print(f"----⚠ {account_usage.error} | size=10 color=#EF4444 {NOOP}")
             if account_usage.provider == "new_api":
                 render_new_api_account_details(account_usage)
+            if account_usage.provider == "openrouter":
+                render_openrouter_account_details(account_usage)
             for window in sort_windows(account_usage.windows):
                 render_window_line(window)
             if not primary or primary.account_id != account_usage.account_id:
@@ -629,6 +775,39 @@ def render_new_api_account_details(account_usage: AccountUsage) -> None:
         print(f"------过期时间 {expired} | size=10 {NOOP}")
 
 
+def render_openrouter_account_details(account_usage: AccountUsage) -> None:
+    details = account_usage.details or {}
+    credits = details.get("credits", {})
+    keys = details.get("keys", [])
+    if not isinstance(credits, dict):
+        credits = {}
+    if not isinstance(keys, list):
+        keys = []
+
+    remaining = openrouter_remaining_credits(credits)
+    print(f"----💰 钱包余额 ${remaining:.2f} | size=10 {NOOP}")
+
+    if not keys:
+        print(f"----(无启用中的 Key) | size=10 {NOOP}")
+        return
+
+    for key in keys:
+        if not isinstance(key, dict):
+            continue
+        key_name = key.get("name") or "Key"
+        remain = parse_float(key.get("limit_remaining"))
+        total_limit = parse_float(key.get("limit"))
+        expires = key.get("expires_at") or "--"
+        reset = key.get("limit_reset") or "不重置"
+        remain_text = "--" if remain is None else format_usd(remain)
+        total_text = "--" if total_limit is None else format_usd(total_limit)
+        print(f"----🔑 {key_name} | size=10 {NOOP}")
+        print(f"------剩余额度 {remain_text} | size=10 {NOOP}")
+        print(f"------总额度 {total_text} | size=10 {NOOP}")
+        print(f"------过期时间 {expires} | size=10 {NOOP}")
+        print(f"------重置策略 {reset} | size=10 {NOOP}")
+
+
 def group_by_provider(usages: List[AccountUsage]) -> Dict[str, List[AccountUsage]]:
     grouped: Dict[str, List[AccountUsage]] = {}
     for usage in usages:
@@ -640,7 +819,7 @@ def group_by_provider(usages: List[AccountUsage]) -> Dict[str, List[AccountUsage
 
 
 def provider_sort_key(provider: str) -> int:
-    order = ["new_api", "cursor", "trae"]
+    order = ["new_api", "openrouter", "cursor", "trae"]
     return order.index(provider) if provider in order else len(order) + 1
 
 
@@ -687,6 +866,16 @@ def parse_float(value) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "y", "on")
+    return False
 
 
 def parse_new_api_base_url(api_input: str) -> str:
@@ -942,12 +1131,19 @@ def notify(message: str) -> None:
 
 
 def provider_choice_options() -> List[str]:
-    return [f"{PROVIDER_LABELS['new_api']} (new_api)", f"{PROVIDER_LABELS['cursor']} (cursor)", f"{PROVIDER_LABELS['trae']} (trae)"]
+    return [
+        f"{PROVIDER_LABELS['new_api']} (new_api)",
+        f"{PROVIDER_LABELS['openrouter']} (openrouter)",
+        f"{PROVIDER_LABELS['cursor']} (cursor)",
+        f"{PROVIDER_LABELS['trae']} (trae)",
+    ]
 
 
 def parse_provider_choice(choice: str) -> Optional[str]:
     if "(new_api)" in choice:
         return "new_api"
+    if "(openrouter)" in choice:
+        return "openrouter"
     if "(cursor)" in choice:
         return "cursor"
     if "(trae)" in choice:
@@ -1086,6 +1282,201 @@ def validation_summary_text(result: Optional[NewApiValidationResult]) -> str:
             format_validation_line(result.level3_ok, "三级 /api/token/", result.level3_msg),
         ]
     )
+
+
+def validate_openrouter_config(
+    management_key: str,
+    timeout: int = 10,
+) -> OpenRouterValidationResult:
+    if not management_key:
+        return OpenRouterValidationResult(
+            level1_ok=False,
+            level1_msg="management key 不能为空",
+            level2_ok=False,
+            level2_msg="未执行",
+            level3_ok=False,
+            level3_msg="未执行",
+        )
+
+    base_url = OPENROUTER_BASE_URL
+    level1_target = base_url
+    l1 = http_probe_status(level1_target, headers={"User-Agent": "llm-usage-swiftbar/1.0"}, timeout=timeout)
+    if not l1["reachable"]:
+        return OpenRouterValidationResult(
+            level1_ok=False,
+            level1_msg=f"不可达: {l1['message']} ({level1_target})",
+            level2_ok=False,
+            level2_msg="未执行",
+            level3_ok=False,
+            level3_msg="未执行",
+        )
+
+    key_info_url = join_base_url(base_url, OPENROUTER_CURRENT_KEY_PATH)
+    level2_ok = False
+    level2_msg = "未执行"
+    try:
+        key_info = fetch_openrouter_current_key(base_url, management_key, timeout=timeout)
+        if not parse_bool(key_info.get("is_management_key")):
+            level2_msg = f"/api/v1/key 未返回 is_management_key=true ({key_info_url})"
+        else:
+            level2_ok = True
+            level2_msg = f"通过（使用 {key_info_url}）"
+    except Exception as err:
+        level2_msg = f"{err} ({key_info_url})"
+
+    key_list_url = join_base_url(base_url, OPENROUTER_KEYS_PATH)
+    level3_ok = False
+    level3_msg = "未执行"
+    try:
+        keys = fetch_openrouter_keys(base_url, management_key, timeout=timeout)
+        has_struct = any("disabled" in item for item in keys if isinstance(item, dict))
+        if not has_struct:
+            level3_msg = f"/api/v1/keys 返回数据缺少 disabled 字段 ({key_list_url})"
+        else:
+            level3_ok = True
+            level3_msg = f"通过（使用 {key_list_url}）"
+    except Exception as err:
+        level3_msg = f"{err} ({key_list_url})"
+
+    return OpenRouterValidationResult(
+        level1_ok=True,
+        level1_msg=f"{l1['message']} ({level1_target})",
+        level2_ok=level2_ok,
+        level2_msg=level2_msg,
+        level3_ok=level3_ok,
+        level3_msg=level3_msg,
+        key_info_url=key_info_url,
+        key_list_url=key_list_url,
+    )
+
+
+def openrouter_validation_summary_text(result: Optional[OpenRouterValidationResult]) -> str:
+    if result is None:
+        return (
+            "测试结果：\n"
+            "🔴 一级 API 可达：未测试\n"
+            "🔴 二级 /api/v1/key：未测试\n"
+            "🔴 三级 /api/v1/keys：未测试"
+        )
+    return "\n".join(
+        [
+            "测试结果：",
+            format_validation_line(result.level1_ok, "一级 API 可达", result.level1_msg),
+            format_validation_line(result.level2_ok, "二级 /api/v1/key", result.level2_msg),
+            format_validation_line(result.level3_ok, "三级 /api/v1/keys", result.level3_msg),
+        ]
+    )
+
+
+def prompt_openrouter_native_dialog(
+    name_value: str,
+    management_key_value: str,
+    status_text: str,
+) -> Optional[Dict[str, str]]:
+    require_macos_interactive()
+    form_text = "\n".join(
+        [
+            f"name={name_value}",
+            f"management_key={management_key_value}",
+        ]
+    )
+    message = (
+        "请按每行 key=value 填写配置：\n"
+        "name=账号名称\n"
+        "management_key=OpenRouter 管理密钥\n\n"
+        f"{status_text}"
+    )
+    script = f'''
+use scripting additions
+set dialogResult to display dialog "{apple_quote(message)}" default answer "{apple_quote(form_text)}" buttons {{"取消", "保存配置", "测试连接"}} default button "测试连接" with title "配置 OpenRouter 账号"
+set buttonTitle to button returned of dialogResult
+set formText to text returned of dialogResult
+return buttonTitle & (ASCII character 31) & formText
+'''
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        if "(-128)" in (result.stderr or ""):
+            return None
+        raise PluginError(result.stderr.strip() or "配置弹窗打开失败")
+    parts = result.stdout.rstrip("\n").split(chr(31), 1)
+    if len(parts) != 2:
+        raise PluginError("配置弹窗结果解析失败")
+    values = parse_key_value_form(parts[1])
+    return {
+        "button": parts[0].strip(),
+        "name": values.get("name", ""),
+        "management_key": values.get("management_key") or values.get("api_token") or values.get("token", ""),
+    }
+
+
+def prompt_openrouter_config() -> Optional[Dict[str, Any]]:
+    def signature(name: str, management_key: str) -> str:
+        return f"{name.strip()}\n{management_key.strip()}"
+
+    def fail_result(msg: str) -> OpenRouterValidationResult:
+        return OpenRouterValidationResult(
+            level1_ok=False,
+            level1_msg=msg,
+            level2_ok=False,
+            level2_msg="未执行",
+            level3_ok=False,
+            level3_msg="未执行",
+        )
+
+    name = ""
+    management_key = ""
+    last_result: Optional[OpenRouterValidationResult] = None
+    tested_signature = None
+
+    while True:
+        dialog = prompt_openrouter_native_dialog(
+            name,
+            management_key,
+            openrouter_validation_summary_text(last_result),
+        )
+        if dialog is None or dialog["button"] == "取消":
+            return None
+
+        name = dialog["name"]
+        management_key = dialog["management_key"]
+
+        if dialog["button"] == "测试连接":
+            if not name:
+                last_result = fail_result("账号名称不能为空")
+                tested_signature = None
+                continue
+            notify("OpenRouter 测试连接中...")
+            try:
+                last_result = validate_openrouter_config(management_key, timeout=10)
+            except Exception as err:
+                last_result = fail_result(str(err))
+            if last_result.all_green():
+                tested_signature = signature(name, management_key)
+            else:
+                tested_signature = None
+            continue
+
+        if dialog["button"] == "保存配置":
+            if not name:
+                last_result = fail_result("账号名称不能为空")
+                continue
+            if not last_result or not last_result.all_green():
+                last_result = fail_result("保存前必须先测试且三级全绿")
+                continue
+            if tested_signature != signature(name, management_key):
+                last_result = fail_result("参数已变更，请重新测试")
+                continue
+            return {
+                "name": name,
+                "management_key": management_key,
+                "base_url": OPENROUTER_BASE_URL,
+            }
+
+        raise PluginError(f"未知按钮: {dialog['button']}")
 
 
 def prompt_new_api_native_dialog(
@@ -1269,6 +1660,39 @@ def action_add_new_api_account(config: Dict) -> None:
     notify(f"已添加账号: {name}")
 
 
+def action_add_openrouter_account(config: Dict) -> None:
+    config_result = prompt_openrouter_config()
+    if not config_result:
+        return
+
+    name = config_result["name"]
+    existing_ids = [item.get("id", "") for item in config.get("accounts", [])]
+    account_id = generate_account_id("openrouter", name, existing_ids)
+    keychain_account = f"openrouter:{account_id}"
+    keychain_set(KEYCHAIN_SERVICE, keychain_account, config_result["management_key"])
+    account = {
+        "id": account_id,
+        "provider": "openrouter",
+        "name": name,
+        "enabled": True,
+        "settings": {
+            "base_url": config_result["base_url"],
+        },
+        "auth": {
+            "type": "keychain",
+            "service": KEYCHAIN_SERVICE,
+            "account": keychain_account,
+        },
+        "manual_windows": [],
+    }
+    config.setdefault("accounts", []).append(account)
+    if not config.get("primary_account_id"):
+        config["primary_account_id"] = account_id
+    save_config(config)
+    clear_cache()
+    notify(f"已添加账号: {name}")
+
+
 def generate_account_id(provider: str, name: str, existing_ids: List[str]) -> str:
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", name.strip().lower()).strip("-")
     if not slug:
@@ -1300,6 +1724,9 @@ def action_add_account() -> None:
 
     if provider == "new_api":
         action_add_new_api_account(config)
+        return
+    if provider == "openrouter":
+        action_add_openrouter_account(config)
         return
 
     name = (prompt_text("输入账号显示名称", "") or "").strip()
